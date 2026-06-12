@@ -132,6 +132,7 @@ South Endfeed TMini Processing Application.
 #include "DataStack.h"
 //#include "VA.h"
 
+#include "TrtRunner.h"
 #include "YOLO11.hpp"
 
 #pragma comment(lib, "Dbghelp.lib")
@@ -152,7 +153,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.0";
+const std::string program_version = "1.2";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -265,6 +266,12 @@ struct IDEAL_POS
 	pcl::PointXYZ GUIDE_PCA;
 };
 
+struct MAX_MIN_RANGE
+{
+	int MAX;
+	int MIN;
+};
+
 struct PRESET_POS
 {
 	bbx F_CONE_4X_F; //45ft - 45, 20 ; 40ft - 40
@@ -294,6 +301,32 @@ struct PRESET_POS
 	bbx R_CST_4X_R; //45ft
 	bbx R_CST_20_F; //45ft/40ft chassis - 20
 
+	MAX_MIN_RANGE F_XT_4XF_RNG;
+	MAX_MIN_RANGE F_XT_4XR_RNG;
+	MAX_MIN_RANGE F_XT_20F_RNG;
+	MAX_MIN_RANGE F_XT_20R_RNG;
+
+	MAX_MIN_RANGE F_IGH_4XF_RNG;
+	MAX_MIN_RANGE F_IGH_4XR_RNG;
+	MAX_MIN_RANGE F_IGH_20F_RNG;
+	MAX_MIN_RANGE F_IGH_20R_RNG;
+
+	MAX_MIN_RANGE F_CST_4XF_RNG;
+	MAX_MIN_RANGE F_CST_4XR_RNG;
+	MAX_MIN_RANGE F_CST_20F_RNG;
+	MAX_MIN_RANGE F_CST_20R_RNG;
+
+	MAX_MIN_RANGE R_XT_4XF_RNG;
+	MAX_MIN_RANGE R_XT_4XR_RNG;
+	MAX_MIN_RANGE R_XT_20F_RNG;
+
+	MAX_MIN_RANGE R_IGH_4XF_RNG;
+	MAX_MIN_RANGE R_IGH_4XR_RNG;
+	MAX_MIN_RANGE R_IGH_20F_RNG;
+
+	MAX_MIN_RANGE R_CST_4XF_RNG;
+	MAX_MIN_RANGE R_CST_4XR_RNG;
+	MAX_MIN_RANGE R_CST_20F_RNG;
 };
 
 struct JobInfo
@@ -308,9 +341,10 @@ struct JobInfo
 	int jobSize = 0;
 
 	bbx presetBox;
+	MAX_MIN_RANGE presetRangeX;
 
 	void set(bool mountCycle, bool offloadCycle,
-		std::string job_pos, std::string chassis_type, int chassis_len, int job_size, bbx preset_box)
+		std::string job_pos, std::string chassis_type, int chassis_len, int job_size, bbx preset_box, MAX_MIN_RANGE preset_range)
 	{
 		isMountCycle = mountCycle;
 		isOffloadCycle = offloadCycle;
@@ -319,6 +353,7 @@ struct JobInfo
 		chassisLen = chassis_len;
 		jobSize = job_size;
 		presetBox = preset_box;
+		presetRangeX = preset_range;
 	}
 
 	void print_jobInfo()
@@ -330,6 +365,7 @@ struct JobInfo
 			", ChassisLen: " + std::to_string(chassisLen) +
 			", JobSize: " + std::to_string(jobSize));
 		logMessage("Job Info - Preset: (" + std::to_string(presetBox.x) + "," + std::to_string(presetBox.y) + "," + std::to_string(presetBox.w) + "," + std::to_string(presetBox.h) + ")");
+		logMessage("Job Info - Preset X (Min, Max): " + std::to_string(presetRangeX.MIN) + " , " + std::to_string(presetRangeX.MAX));
 	}
 };
 
@@ -408,6 +444,8 @@ bool DEBUG_CONVERT_PCL_RANGE = false;
 
 bool ENALBE_RESTART_APPLICATION = false;
 bool ENABLE_SAVE_LOG_BIT = false;
+bool ENABLE_PRESET_VISUAL_ON_STREAM = false;
+bool ENABLE_IMAGE_LOGGING_ONLY = false;
 
 std::string CURRENT_SENSOR_POSITION = "FRONT";
 bool DIRECTION_FRONT_IS_RIGHT = true; //current sample. TODO: need to read from INI.
@@ -417,6 +455,16 @@ int PROB_LIMIT = 50;
 std::string onnx_model_path;
 
 double TILT_ANGLE_DEG = 0.0;
+
+int SENSOR_HEIGHT = 0;
+
+MAX_MIN_RANGE HEIGHT_MMR;
+MAX_MIN_RANGE TROLLEY_MMR;
+
+int HEIGHT_RANGE_MAX = 200;
+int HEIGHT_RANGE_MIN = -400;
+int TROLLEY_RANGE_MAX = 2000;
+int TROLLEY_RANGE_MIN = 1500;
 
 PRESET_POS presetPos;
 
@@ -529,7 +577,8 @@ std::string job_result_log_file_name;
 std::chrono::system_clock::time_point sensor_last_attempted_time = std::chrono::system_clock::now();
 std::chrono::system_clock::time_point sensor_last_connected_time = std::chrono::system_clock::now();
 
-YOLO11Detector yolo_detector;
+//YOLO11Detector yolo_detector;
+TrtRunner trt_detector;
 
 bbx LDO_intrim;
 bbx LDO_Base;
@@ -582,7 +631,6 @@ int devOut_LDO_x, devOut_LDO_y;
 //2025.03.11
 int devOut_x_mm, devOut_y_mm;
 int devOut_pca_x, devOut_pca_y, devOut_pca_z;
-
 
 bool bDetected_hole = false, bDetected_cone = false;
 
@@ -699,6 +747,91 @@ auto pDataHandler = std::make_shared<VisionaryTMiniData>();
 VisionaryDataStream dataStream(pDataHandler);
 VisionaryControl visionaryControl;
 
+//Save Update 2026.03.04
+struct SaveTask
+{
+	cv::Mat oImage;
+	cv::Mat resImage;
+	pcl::PointCloud<pcl::PointXYZ>::ConstPtr cloud; //pointer not value
+	bool isJobLog;
+	std::string msg;
+	std::chrono::system_clock::time_point frameTime;
+
+	SaveTask() = default;
+
+	// Constructor matching the usage: SaveTask(img, res_img, pcPointCloud, true, std::move(msg), ts);
+	SaveTask(const cv::Mat& oImg,
+		const cv::Mat& rImg,
+		const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cld,
+		bool jobLog,
+		std::string&& message,
+		std::chrono::system_clock::time_point time)
+		: oImage(oImg.clone()),
+		resImage(rImg.clone()),
+		cloud(cld),
+		isJobLog(jobLog),
+		msg(std::move(message)),
+		frameTime(time)
+	{
+	}
+};
+
+class ThreadSafeQueue {
+private:
+	std::queue<SaveTask> q;
+	mutable std::mutex mtx;
+	std::condition_variable cv;
+	bool stopping = false;
+
+public:
+	void push(SaveTask&& task) {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			q.push(std::move(task));
+		}
+		cv.notify_one();
+	}
+
+	// Blocks until an item exists OR stop() is called.
+	bool pop(SaveTask& out) {
+		std::unique_lock<std::mutex> lock(mtx);
+		cv.wait(lock, [&] { return stopping || !q.empty(); });
+		if (stopping && q.empty()) return false;
+		out = std::move(q.front());
+		q.pop();
+		return true;
+	}
+
+	// Optional: batch drain
+	bool try_pop(SaveTask& out) {
+		std::lock_guard<std::mutex> lock(mtx);
+		if (q.empty()) return false;
+		out = std::move(q.front());
+		q.pop();
+		return true;
+	}
+
+	void stop() {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			stopping = true;
+		}
+		cv.notify_all();
+	}
+
+	size_t size() const {
+		std::lock_guard<std::mutex> lock(mtx);
+		return q.size();
+	}
+
+	void clear() {
+		std::lock_guard<std::mutex> lock(mtx);
+		while (!q.empty()) q.pop();
+	}
+};
+
+
+/*
 class ThreadSafeQueue
 {
 private:
@@ -735,6 +868,8 @@ public:
 		}
 	}
 };
+*/
+
 ThreadSafeQueue tsq;
 
 DataStack dataStack;
@@ -1050,6 +1185,26 @@ void jobLogMessage(const std::string& message) {
 * INI Parsing Functions
 */
 
+static inline void remove_all_whitespace(std::string& s) {
+	s.erase(std::remove_if(s.begin(), s.end(),
+		[](unsigned char c) { return std::isspace(c); }),
+		s.end());
+}
+
+static inline std::vector<std::string> split_semicolon(const std::string& s) {
+	std::vector<std::string> out;
+	size_t start = 0;
+	while (start <= s.size()) {
+		size_t pos = s.find(';', start);
+		if (pos == std::string::npos) pos = s.size();
+		out.emplace_back(s.substr(start, pos - start));
+		start = pos + 1;
+	}
+	// optional: drop trailing empty if string ends with ';'
+	if (!out.empty() && out.back().empty()) out.pop_back();
+	return out;
+}
+
 auto parseAppName(string path) -> bool
 {
 	try
@@ -1096,6 +1251,8 @@ auto parseINI(string path) -> bool
 		PROB_LIMIT = std::stoi(inidata.get("SYSTEM").get("PROB_LIMIT"));
 		ENABLE_SAVE_LOG_BIT = inidata.get("SYSTEM").get("ENABLE_SAVE_LOG_BIT") == "1" ? true : false;
 		ENALBE_RESTART_APPLICATION = inidata.get("SYSTEM").get("ENABLE_RESTART_APPLICATION") == "1" ? true : false;
+		ENABLE_PRESET_VISUAL_ON_STREAM = inidata.get("SYSTEM").get("ENABLE_PRESET_VISUAL_ON_STREAM") == "1" ? true : false;
+		ENABLE_IMAGE_LOGGING_ONLY = inidata.get("SYSTEM").get("ENABLE_IMAGE_LOGGING_ONLY") == "1" ? true : false;
 
 		onnx_model_path = inidata.get("MODEL").get("ONNX_PATH");
 		logMessage("onnx model path: " + onnx_model_path);
@@ -1141,119 +1298,379 @@ void parseProcessINI(string path)
 
 			TILT_ANGLE_DEG = std::stod(ini.get("SETTINGS").get("TILT_ANGLE_DEG"));
 
-			//Preset Load
-			presetPos.F_CONE_4X_F.x = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_F_X"));
-			presetPos.F_CONE_4X_F.y = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_F_Y"));
-			presetPos.F_CONE_4X_F.w = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_F_W"));
-			presetPos.F_CONE_4X_F.h = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_F_H"));
+			SENSOR_HEIGHT = std::stoi(ini.get("SETTINGS").get("SENSOR_HEIGHT"));
 
-			presetPos.F_CONE_4X_R.x = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_R_X"));
-			presetPos.F_CONE_4X_R.y = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_R_Y"));
-			presetPos.F_CONE_4X_R.w = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_R_W"));
-			presetPos.F_CONE_4X_R.h = std::stof(ini.get("PRESET_FRONT").get("CONE_4X_R_H"));
+			HEIGHT_RANGE_MAX = std::stoi(ini.get("SETTINGS").get("HEIGHT_RANGE_MAX"));
+			HEIGHT_RANGE_MIN = std::stoi(ini.get("SETTINGS").get("HEIGHT_RANGE_MIN"));
 
-			presetPos.F_CONE_20_F.x = std::stof(ini.get("PRESET_FRONT").get("CONE_20_F_X"));
-			presetPos.F_CONE_20_F.y = std::stof(ini.get("PRESET_FRONT").get("CONE_20_F_Y"));
-			presetPos.F_CONE_20_F.w = std::stof(ini.get("PRESET_FRONT").get("CONE_20_F_W"));
-			presetPos.F_CONE_20_F.h = std::stof(ini.get("PRESET_FRONT").get("CONE_20_F_H"));
+			HEIGHT_MMR.MAX = HEIGHT_RANGE_MAX;
+			HEIGHT_MMR.MIN = HEIGHT_RANGE_MIN;
 
-			presetPos.F_CONE_20_R.x = std::stof(ini.get("PRESET_FRONT").get("CONE_20_R_X"));
-			presetPos.F_CONE_20_R.y = std::stof(ini.get("PRESET_FRONT").get("CONE_20_R_Y"));
-			presetPos.F_CONE_20_R.w = std::stof(ini.get("PRESET_FRONT").get("CONE_20_R_W"));
-			presetPos.F_CONE_20_R.h = std::stof(ini.get("PRESET_FRONT").get("CONE_20_R_H"));
+			TROLLEY_RANGE_MAX = std::stoi(ini.get("SETTINGS").get("TROLLEY_RANGE_MAX"));
+			TROLLEY_RANGE_MIN = std::stoi(ini.get("SETTINGS").get("TROLLEY_RANGE_MIN"));
+
+			TROLLEY_MMR.MAX = TROLLEY_RANGE_MAX;
+			TROLLEY_MMR.MIN = TROLLEY_RANGE_MIN;
+
+			//PCA - 3D -- FRONT
+			//XT
+			auto tVal = ini.get("PRESET_FRONT_3D").get("XT_4XF");
+			remove_all_whitespace(tVal);
+			auto tParts = split_semicolon(tVal);
+
+			presetPos.F_XT_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_XT_4XF_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("XT_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_XT_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_XT_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("XT_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_XT_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_XT_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("XT_20R");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_XT_20R_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_XT_20R_RNG.MIN = std::stoi(tParts.at(1));
 
 			//IGH
-			presetPos.F_IGH_4X_F.x = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_F_X"));
-			presetPos.F_IGH_4X_F.y = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_F_Y"));
-			presetPos.F_IGH_4X_F.w = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_F_W"));
-			presetPos.F_IGH_4X_F.h = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_F_H"));
+			tVal = ini.get("PRESET_FRONT_3D").get("IGH_4XF");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
 
-			presetPos.F_IGH_4X_R.x = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_R_X"));
-			presetPos.F_IGH_4X_R.y = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_R_Y"));
-			presetPos.F_IGH_4X_R.w = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_R_W"));
-			presetPos.F_IGH_4X_R.h = std::stof(ini.get("PRESET_FRONT").get("IGH_4X_R_H"));
+			presetPos.F_IGH_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_IGH_4XF_RNG.MIN = std::stoi(tParts.at(1));
 
-			presetPos.F_IGH_20_F.x = std::stof(ini.get("PRESET_FRONT").get("IGH_20_F_X"));
-			presetPos.F_IGH_20_F.y = std::stof(ini.get("PRESET_FRONT").get("IGH_20_F_Y"));
-			presetPos.F_IGH_20_F.w = std::stof(ini.get("PRESET_FRONT").get("IGH_20_F_W"));
-			presetPos.F_IGH_20_F.h = std::stof(ini.get("PRESET_FRONT").get("IGH_20_F_H"));
+			tVal = ini.get("PRESET_FRONT_3D").get("IGH_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
 
-			presetPos.F_IGH_20_R.x = std::stof(ini.get("PRESET_FRONT").get("IGH_20_R_X"));
-			presetPos.F_IGH_20_R.y = std::stof(ini.get("PRESET_FRONT").get("IGH_20_R_Y"));
-			presetPos.F_IGH_20_R.w = std::stof(ini.get("PRESET_FRONT").get("IGH_20_R_W"));
-			presetPos.F_IGH_20_R.h = std::stof(ini.get("PRESET_FRONT").get("IGH_20_R_H"));
+			presetPos.F_IGH_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_IGH_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("IGH_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_IGH_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_IGH_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("IGH_20R");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_IGH_20R_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_IGH_20R_RNG.MIN = std::stoi(tParts.at(1));
 
 			//CST
-			presetPos.F_CST_4X_F.x = std::stof(ini.get("PRESET_FRONT").get("CST_4X_F_X"));
-			presetPos.F_CST_4X_F.y = std::stof(ini.get("PRESET_FRONT").get("CST_4X_F_Y"));
-			presetPos.F_CST_4X_F.w = std::stof(ini.get("PRESET_FRONT").get("CST_4X_F_W"));
-			presetPos.F_CST_4X_F.h = std::stof(ini.get("PRESET_FRONT").get("CST_4X_F_H"));
+			tVal = ini.get("PRESET_FRONT_3D").get("CST_4XF");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
 
-			presetPos.F_CST_4X_R.x = std::stof(ini.get("PRESET_FRONT").get("CST_4X_R_X"));
-			presetPos.F_CST_4X_R.y = std::stof(ini.get("PRESET_FRONT").get("CST_4X_R_Y"));
-			presetPos.F_CST_4X_R.w = std::stof(ini.get("PRESET_FRONT").get("CST_4X_R_W"));
-			presetPos.F_CST_4X_R.h = std::stof(ini.get("PRESET_FRONT").get("CST_4X_R_H"));
+			presetPos.F_CST_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_CST_4XF_RNG.MIN = std::stoi(tParts.at(1));
 
-			presetPos.F_CST_20_F.x = std::stof(ini.get("PRESET_FRONT").get("CST_20_F_X"));
-			presetPos.F_CST_20_F.y = std::stof(ini.get("PRESET_FRONT").get("CST_20_F_Y"));
-			presetPos.F_CST_20_F.w = std::stof(ini.get("PRESET_FRONT").get("CST_20_F_W"));
-			presetPos.F_CST_20_F.h = std::stof(ini.get("PRESET_FRONT").get("CST_20_F_H"));
+			tVal = ini.get("PRESET_FRONT_3D").get("CST_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
 
-			presetPos.F_CST_20_R.x = std::stof(ini.get("PRESET_FRONT").get("CST_20_R_X"));
-			presetPos.F_CST_20_R.y = std::stof(ini.get("PRESET_FRONT").get("CST_20_R_Y"));
-			presetPos.F_CST_20_R.w = std::stof(ini.get("PRESET_FRONT").get("CST_20_R_W"));
-			presetPos.F_CST_20_R.h = std::stof(ini.get("PRESET_FRONT").get("CST_20_R_H"));
+			presetPos.F_CST_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_CST_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("CST_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_CST_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_CST_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_FRONT_3D").get("CST_20R");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.F_CST_20R_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.F_CST_20R_RNG.MIN = std::stoi(tParts.at(1));
+
+			//REAR
+			//XT
+			tVal = ini.get("PRESET_REAR_3D").get("XT_4XF");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_XT_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_XT_4XF_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("XT_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_XT_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_XT_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("XT_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_XT_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_XT_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+			//IGH
+			tVal = ini.get("PRESET_REAR_3D").get("IGH_4XF");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_IGH_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_IGH_4XF_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("IGH_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_IGH_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_IGH_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("IGH_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_IGH_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_IGH_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+			//CST
+			tVal = ini.get("PRESET_REAR_3D").get("CST_4XF");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_CST_4XF_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_CST_4XF_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("CST_4XR");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_CST_4XR_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_CST_4XR_RNG.MIN = std::stoi(tParts.at(1));
+
+			tVal = ini.get("PRESET_REAR_3D").get("CST_20F");
+			remove_all_whitespace(tVal);
+			tParts = split_semicolon(tVal);
+
+			presetPos.R_CST_20F_RNG.MAX = std::stoi(tParts.at(0));
+			presetPos.R_CST_20F_RNG.MIN = std::stoi(tParts.at(1));
+
+
+			//Preset Load
+#pragma region FRONT - XT Parse
+			auto tempVal = ini.get("PRESET_FRONT").get("XT_4XF");
+			remove_all_whitespace(tempVal);
+			auto parts = split_semicolon(tempVal);
+
+			presetPos.F_CONE_4X_F.x = std::stof(parts.at(0));
+			presetPos.F_CONE_4X_F.y = std::stof(parts.at(1));
+			presetPos.F_CONE_4X_F.w = std::stof(parts.at(2));
+			presetPos.F_CONE_4X_F.h = std::stof(parts.at(3));
+
+			logMessage("[INI] XT_4XF - X:" + std::to_string(presetPos.F_CONE_4X_F.x) + " , Y: " + std::to_string(presetPos.F_CONE_4X_F.y) + " , W: " + std::to_string(presetPos.F_CONE_4X_F.w) + " , H: " + std::to_string(presetPos.F_CONE_4X_F.h));
+
+			tempVal = ini.get("PRESET_FRONT").get("XT_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CONE_4X_R.x = std::stof(parts.at(0));
+			presetPos.F_CONE_4X_R.y = std::stof(parts.at(1));
+			presetPos.F_CONE_4X_R.w = std::stof(parts.at(2));
+			presetPos.F_CONE_4X_R.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("XT_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CONE_20_F.x = std::stof(parts.at(0));
+			presetPos.F_CONE_20_F.y = std::stof(parts.at(1));
+			presetPos.F_CONE_20_F.w = std::stof(parts.at(2));
+			presetPos.F_CONE_20_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("XT_20R");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CONE_20_R.x = std::stof(parts.at(0));
+			presetPos.F_CONE_20_R.y = std::stof(parts.at(1));
+			presetPos.F_CONE_20_R.w = std::stof(parts.at(2));
+			presetPos.F_CONE_20_R.h = std::stof(parts.at(3));
+#pragma endregion
+#pragma region FRONT - IGH Parse
+			tempVal = ini.get("PRESET_FRONT").get("IGH_4XF");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_IGH_4X_F.x = std::stof(parts.at(0));
+			presetPos.F_IGH_4X_F.y = std::stof(parts.at(1));
+			presetPos.F_IGH_4X_F.w = std::stof(parts.at(2));
+			presetPos.F_IGH_4X_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("IGH_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_IGH_4X_R.x = std::stof(parts.at(0));
+			presetPos.F_IGH_4X_R.y = std::stof(parts.at(1));
+			presetPos.F_IGH_4X_R.w = std::stof(parts.at(2));
+			presetPos.F_IGH_4X_R.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("IGH_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_IGH_20_F.x = std::stof(parts.at(0));
+			presetPos.F_IGH_20_F.y = std::stof(parts.at(1));
+			presetPos.F_IGH_20_F.w = std::stof(parts.at(2));
+			presetPos.F_IGH_20_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("IGH_20R");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_IGH_20_R.x = std::stof(parts.at(0));
+			presetPos.F_IGH_20_R.y = std::stof(parts.at(1));
+			presetPos.F_IGH_20_R.w = std::stof(parts.at(2));
+			presetPos.F_IGH_20_R.h = std::stof(parts.at(3));
+#pragma endregion
+#pragma region FRONT - CST Parse
+			tempVal = ini.get("PRESET_FRONT").get("CST_4XF");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CST_4X_F.x = std::stof(parts.at(0));
+			presetPos.F_CST_4X_F.y = std::stof(parts.at(1));
+			presetPos.F_CST_4X_F.w = std::stof(parts.at(2));
+			presetPos.F_CST_4X_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("CST_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CST_4X_R.x = std::stof(parts.at(0));
+			presetPos.F_CST_4X_R.y = std::stof(parts.at(1));
+			presetPos.F_CST_4X_R.w = std::stof(parts.at(2));
+			presetPos.F_CST_4X_R.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("CST_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CST_20_F.x = std::stof(parts.at(0));
+			presetPos.F_CST_20_F.y = std::stof(parts.at(1));
+			presetPos.F_CST_20_F.w = std::stof(parts.at(2));
+			presetPos.F_CST_20_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_FRONT").get("CST_20R");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.F_CST_20_R.x = std::stof(parts.at(0));
+			presetPos.F_CST_20_R.y = std::stof(parts.at(1));
+			presetPos.F_CST_20_R.w = std::stof(parts.at(2));
+			presetPos.F_CST_20_R.h = std::stof(parts.at(3));
+#pragma endregion
 
 			//REAR PRESET
+#pragma region REAR - XT Parse
+			tempVal = ini.get("PRESET_REAR").get("XT_4XF");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
 
-			//CONE
-			presetPos.R_CONE_4X_F.x = std::stof(ini.get("PRESET_REAR").get("CONE_4X_F_X"));
-			presetPos.R_CONE_4X_F.y = std::stof(ini.get("PRESET_REAR").get("CONE_4X_F_Y"));
-			presetPos.R_CONE_4X_F.w = std::stof(ini.get("PRESET_REAR").get("CONE_4X_F_W"));
-			presetPos.R_CONE_4X_F.h = std::stof(ini.get("PRESET_REAR").get("CONE_4X_F_H"));
+			presetPos.R_CONE_4X_F.x = std::stof(parts.at(0));
+			presetPos.R_CONE_4X_F.y = std::stof(parts.at(1));
+			presetPos.R_CONE_4X_F.w = std::stof(parts.at(2));
+			presetPos.R_CONE_4X_F.h = std::stof(parts.at(3));
 
-			presetPos.R_CONE_4X_R.x = std::stof(ini.get("PRESET_REAR").get("CONE_4X_R_X"));
-			presetPos.R_CONE_4X_R.y = std::stof(ini.get("PRESET_REAR").get("CONE_4X_R_Y"));
-			presetPos.R_CONE_4X_R.w = std::stof(ini.get("PRESET_REAR").get("CONE_4X_R_W"));
-			presetPos.R_CONE_4X_R.h = std::stof(ini.get("PRESET_REAR").get("CONE_4X_R_H"));
+			tempVal = ini.get("PRESET_REAR").get("XT_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
 
-			presetPos.R_CONE_20_F.x = std::stof(ini.get("PRESET_REAR").get("CONE_20_F_X"));
-			presetPos.R_CONE_20_F.y = std::stof(ini.get("PRESET_REAR").get("CONE_20_F_Y"));
-			presetPos.R_CONE_20_F.w = std::stof(ini.get("PRESET_REAR").get("CONE_20_F_W"));
-			presetPos.R_CONE_20_F.h = std::stof(ini.get("PRESET_REAR").get("CONE_20_F_H"));
+			presetPos.R_CONE_4X_R.x = std::stof(parts.at(0));
+			presetPos.R_CONE_4X_R.y = std::stof(parts.at(1));
+			presetPos.R_CONE_4X_R.w = std::stof(parts.at(2));
+			presetPos.R_CONE_4X_R.h = std::stof(parts.at(3));
 
-			//IGH
-			presetPos.R_IGH_4X_F.x = std::stof(ini.get("PRESET_REAR").get("IGH_4X_F_X"));
-			presetPos.R_IGH_4X_F.y = std::stof(ini.get("PRESET_REAR").get("IGH_4X_F_Y"));
-			presetPos.R_IGH_4X_F.w = std::stof(ini.get("PRESET_REAR").get("IGH_4X_F_W"));
-			presetPos.R_IGH_4X_F.h = std::stof(ini.get("PRESET_REAR").get("IGH_4X_F_H"));
+			tempVal = ini.get("PRESET_REAR").get("XT_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
 
-			presetPos.R_IGH_4X_R.x = std::stof(ini.get("PRESET_REAR").get("IGH_4X_R_X"));
-			presetPos.R_IGH_4X_R.y = std::stof(ini.get("PRESET_REAR").get("IGH_4X_R_Y"));
-			presetPos.R_IGH_4X_R.w = std::stof(ini.get("PRESET_REAR").get("IGH_4X_R_W"));
-			presetPos.R_IGH_4X_R.h = std::stof(ini.get("PRESET_REAR").get("IGH_4X_R_H"));
+			presetPos.R_CONE_20_F.x = std::stof(parts.at(0));
+			presetPos.R_CONE_20_F.y = std::stof(parts.at(1));
+			presetPos.R_CONE_20_F.w = std::stof(parts.at(2));
+			presetPos.R_CONE_20_F.h = std::stof(parts.at(3));
 
-			presetPos.R_IGH_20_F.x = std::stof(ini.get("PRESET_REAR").get("IGH_20_F_X"));
-			presetPos.R_IGH_20_F.y = std::stof(ini.get("PRESET_REAR").get("IGH_20_F_Y"));
-			presetPos.R_IGH_20_F.w = std::stof(ini.get("PRESET_REAR").get("IGH_20_F_W"));
-			presetPos.R_IGH_20_F.h = std::stof(ini.get("PRESET_REAR").get("IGH_20_F_H"));
+#pragma endregion
+#pragma region REAR - IGH Parse
+			tempVal = ini.get("PRESET_REAR").get("IGH_4XF");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
 
-			//CST
-			presetPos.R_CST_4X_F.x = std::stof(ini.get("PRESET_REAR").get("CST_4X_F_X"));
-			presetPos.R_CST_4X_F.y = std::stof(ini.get("PRESET_REAR").get("CST_4X_F_Y"));
-			presetPos.R_CST_4X_F.w = std::stof(ini.get("PRESET_REAR").get("CST_4X_F_W"));
-			presetPos.R_CST_4X_F.h = std::stof(ini.get("PRESET_REAR").get("CST_4X_F_H"));
+			presetPos.R_IGH_4X_F.x = std::stof(parts.at(0));
+			presetPos.R_IGH_4X_F.y = std::stof(parts.at(1));
+			presetPos.R_IGH_4X_F.w = std::stof(parts.at(2));
+			presetPos.R_IGH_4X_F.h = std::stof(parts.at(3));
 
-			presetPos.R_CST_4X_R.x = std::stof(ini.get("PRESET_REAR").get("CST_4X_R_X"));
-			presetPos.R_CST_4X_R.y = std::stof(ini.get("PRESET_REAR").get("CST_4X_R_Y"));
-			presetPos.R_CST_4X_R.w = std::stof(ini.get("PRESET_REAR").get("CST_4X_R_W"));
-			presetPos.R_CST_4X_R.h = std::stof(ini.get("PRESET_REAR").get("CST_4X_R_H"));
+			tempVal = ini.get("PRESET_REAR").get("IGH_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
 
-			presetPos.R_CST_20_F.x = std::stof(ini.get("PRESET_REAR").get("CST_20_F_X"));
-			presetPos.R_CST_20_F.y = std::stof(ini.get("PRESET_REAR").get("CST_20_F_Y"));
-			presetPos.R_CST_20_F.w = std::stof(ini.get("PRESET_REAR").get("CST_20_F_W"));
-			presetPos.R_CST_20_F.h = std::stof(ini.get("PRESET_REAR").get("CST_20_F_H"));
+			presetPos.R_IGH_4X_R.x = std::stof(parts.at(0));
+			presetPos.R_IGH_4X_R.y = std::stof(parts.at(1));
+			presetPos.R_IGH_4X_R.w = std::stof(parts.at(2));
+			presetPos.R_IGH_4X_R.h = std::stof(parts.at(3));
 
+			tempVal = ini.get("PRESET_REAR").get("IGH_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.R_IGH_20_F.x = std::stof(parts.at(0));
+			presetPos.R_IGH_20_F.y = std::stof(parts.at(1));
+			presetPos.R_IGH_20_F.w = std::stof(parts.at(2));
+			presetPos.R_IGH_20_F.h = std::stof(parts.at(3));
+
+#pragma endregion
+#pragma region REAR - CST Parse
+			tempVal = ini.get("PRESET_REAR").get("CST_4XF");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.R_CST_4X_F.x = std::stof(parts.at(0));
+			presetPos.R_CST_4X_F.y = std::stof(parts.at(1));
+			presetPos.R_CST_4X_F.w = std::stof(parts.at(2));
+			presetPos.R_CST_4X_F.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_REAR").get("CST_4XR");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.R_CST_4X_R.x = std::stof(parts.at(0));
+			presetPos.R_CST_4X_R.y = std::stof(parts.at(1));
+			presetPos.R_CST_4X_R.w = std::stof(parts.at(2));
+			presetPos.R_CST_4X_R.h = std::stof(parts.at(3));
+
+			tempVal = ini.get("PRESET_REAR").get("CST_20F");
+			remove_all_whitespace(tempVal);
+			parts = split_semicolon(tempVal);
+
+			presetPos.R_CST_20_F.x = std::stof(parts.at(0));
+			presetPos.R_CST_20_F.y = std::stof(parts.at(1));
+			presetPos.R_CST_20_F.w = std::stof(parts.at(2));
+			presetPos.R_CST_20_F.h = std::stof(parts.at(3));
+
+#pragma endregion
 
 			//Landout-VA
 			//LDO_NEAR_X_THRESHOLD = std::stoi(ini.get("LANDOUT").get("NEAR_X_THRESHOLD"));
@@ -1902,37 +2319,41 @@ void parseCommand(char recvbuf[])
 				else if (SPRD_45ft) job_size = 45;
 
 				bbx presetTarget;
+				MAX_MIN_RANGE presetTargetX;
 				//PRESET SELECT
 				if (CURRENT_SENSOR_POSITION == "FRONT")
 				{
 					if (chassis_type == "XT")
 					{
-						if (chassis_len == 45 && job_size == 40) presetTarget = presetPos.F_CONE_4X_R;
-						else if (chassis_len == 45 && job_pos == "Small") presetTarget = presetPos.F_CONE_20_R;
-						else if (chassis_len == 40 && job_pos == "Small") presetTarget = presetPos.F_CONE_20_F;
+						if (chassis_len == 45 && job_size == 40) { presetTarget = presetPos.F_CONE_4X_R; presetTargetX = presetPos.F_XT_4XR_RNG; }
+						else if (chassis_len == 45 && job_pos == "Small") { presetTarget = presetPos.F_CONE_20_R; presetTargetX = presetPos.F_XT_20R_RNG; }
+						else if (chassis_len == 40 && job_pos == "Small") { presetTarget = presetPos.F_CONE_20_F; presetTargetX = presetPos.F_XT_20F_RNG; }
 						else
 						{
 							presetTarget = presetPos.F_CONE_4X_F;
+							presetTargetX = presetPos.F_XT_4XF_RNG;
 						}
 					}
 					else if (chassis_type == "IGH")
 					{
-						if (chassis_len == 45 && job_size == 40) presetTarget = presetPos.F_IGH_4X_R;
-						else if (chassis_len == 45 && job_pos == "Small") presetTarget = presetPos.F_IGH_20_R;
-						else if (chassis_len == 40 && job_pos == "Small") presetTarget = presetPos.F_IGH_20_F;
+						if (chassis_len == 45 && job_size == 40) { presetTarget = presetPos.F_IGH_4X_R; presetTargetX = presetPos.F_IGH_4XR_RNG; }
+						else if (chassis_len == 45 && job_pos == "Small") { presetTarget = presetPos.F_IGH_20_R; presetTargetX = presetPos.F_IGH_20R_RNG;}
+						else if (chassis_len == 40 && job_pos == "Small") { presetTarget = presetPos.F_IGH_20_F; presetTargetX = presetPos.F_IGH_20F_RNG;}
 						else
 						{
 							presetTarget = presetPos.F_IGH_4X_F;
+							presetTargetX = presetPos.F_IGH_4XF_RNG;
 						}
 					}
 					else if (chassis_type == "CST")
 					{
-						if (chassis_len == 45 && job_size == 40) presetTarget = presetPos.F_CST_4X_R;
-						else if (chassis_len == 45 && job_pos == "Small") presetTarget = presetPos.F_CST_20_R;
-						else if (chassis_len == 40 && job_pos == "Small") presetTarget = presetPos.F_CST_20_F;
+						if (chassis_len == 45 && job_size == 40) { presetTarget = presetPos.F_CST_4X_R; presetTargetX = presetPos.F_CST_4XR_RNG; }
+						else if (chassis_len == 45 && job_pos == "Small") { presetTarget = presetPos.F_CST_20_R; presetTargetX = presetPos.F_CST_20R_RNG; }
+						else if (chassis_len == 40 && job_pos == "Small") { presetTarget = presetPos.F_CST_20_F; presetTargetX = presetPos.F_CST_20F_RNG; }
 						else
 						{
 							presetTarget = presetPos.F_CST_4X_F;
+							presetTargetX = presetPos.F_CST_4XF_RNG;
 						}
 					}
 				}
@@ -1940,26 +2361,26 @@ void parseCommand(char recvbuf[])
 				{
 					if (chassis_type == "XT")
 					{
-						if (job_pos == "Big") presetTarget = presetPos.R_CONE_20_F;
-						else if (chassis_len == 40) presetTarget = presetPos.R_CONE_4X_F;
-						else presetTarget = presetPos.R_CONE_4X_R;
+						if (job_pos == "Big") { presetTarget = presetPos.R_CONE_20_F; presetTargetX = presetPos.R_XT_20F_RNG; }
+						else if (chassis_len == 40) { presetTarget = presetPos.R_CONE_4X_F; presetTargetX = presetPos.R_XT_4XF_RNG; }
+						else { presetTarget = presetPos.R_CONE_4X_R; presetTargetX = presetPos.R_XT_4XR_RNG; }
 					}
 					else if (chassis_type == "IGH")
 					{
-						if (job_pos == "Big") presetTarget = presetPos.R_IGH_20_F;
-						else if (chassis_len == 40) presetTarget = presetPos.R_IGH_4X_F;
-						else presetTarget = presetPos.R_IGH_4X_R;
+						if (job_pos == "Big") { presetTarget = presetPos.R_IGH_20_F; presetTargetX = presetPos.R_IGH_20F_RNG; }
+						else if (chassis_len == 40) { presetTarget = presetPos.R_IGH_4X_F; presetTargetX = presetPos.R_IGH_4XF_RNG; }
+						else { presetTarget = presetPos.R_IGH_4X_R; presetTargetX = presetPos.R_IGH_4XR_RNG; }
 					}
 					else if (chassis_type == "CST")
 					{
-						if (job_pos == "Big") presetTarget = presetPos.R_CST_20_F;
-						else if (chassis_len == 40) presetTarget = presetPos.R_CST_4X_F;
-						else presetTarget = presetPos.R_CST_4X_R;
+						if (job_pos == "Big") { presetTarget = presetPos.R_CST_20_F; presetTargetX = presetPos.R_CST_20F_RNG; }
+						else if (chassis_len == 40) { presetTarget = presetPos.R_CST_4X_F; presetTargetX = presetPos.R_CST_4XF_RNG; }
+						else { presetTarget = presetPos.R_CST_4X_R; presetTargetX = presetPos.R_CST_4XR_RNG; }
 					}
 				}
 
 				current_job_info.set(Mount_Cycle, Offload_Cycle,
-					job_pos, chassis_type, chassis_len, job_size, presetTarget);
+					job_pos, chassis_type, chassis_len, job_size, presetTarget, presetTargetX);
 
 				logMessage("New Job Pulse Detected!");
 			}
@@ -1980,15 +2401,15 @@ void parseCommand(char recvbuf[])
 				//streaming thread will be triggered from tmini_ctrl thread.
 				
 				//Create necessary job result folders and specify names.
-				//job_result_folder_name = std::string("JOB_LOG/");
-				//createDirectory_ifexists(job_result_folder_name);
-				//job_result_folder_name += std::string("Lane") + std::to_string(target_lane_number) + "/";
-				//createDirectory_ifexists(job_result_folder_name);
+				job_result_folder_name = std::string("JOB_LOG/");
+				createDirectory_ifexists(job_result_folder_name);
+				job_result_folder_name += std::string("Lane") + std::to_string(target_lane_number) + "/";
+				createDirectory_ifexists(job_result_folder_name);
 
 				
-				//job_result_folder_name.append(job_name);
-				//job_result_folder_name.append("_JOBLOG");
-				//createDirectory_ifexists(job_result_folder_name);
+				job_result_folder_name.append(job_name);
+				job_result_folder_name.append("_JOBLOG");
+				createDirectory_ifexists(job_result_folder_name);
 
 				//images, pointcloud
 				//createDirectory_ifexists(job_result_folder_name + "/Image");
@@ -2081,7 +2502,7 @@ void parseCommand(char recvbuf[])
 				logMessage("Deleting save logs as per command.");
 
 				//stop any files on queue
-				if (tsq.GetQueueLen() > 0)
+				if (tsq.size() > 0)
 				{
 					tsq.clear();
 					logMessage("Cleared Thread Safe Queue.");
@@ -2162,7 +2583,7 @@ void parseCommand(char recvbuf[])
 
 				if (ENALBE_RESTART_APPLICATION)
 				{
-					if (trigger_terminate && tsq.GetQueueLen() == 0)
+					if (trigger_terminate && tsq.size() == 0)
 					{
 						logMessage("Triggered Application Termination!");
 
@@ -2204,6 +2625,171 @@ void parseCommand(char recvbuf[])
 	}
 }
 
+#pragma region TensorRT - 10.48
+
+struct LetterboxInfo {
+	float scale = 1.f;
+	int pad_x = 0;
+	int pad_y = 0;
+	int new_w = 0;
+	int new_h = 0;
+};
+
+// Letterbox to (dst_w, dst_h), pads with 114 like YOLO
+static cv::Mat letterbox(const cv::Mat& src, int dst_w, int dst_h, LetterboxInfo& info) {
+	int src_w = src.cols, src_h = src.rows;
+	float r = std::min((float)dst_w / src_w, (float)dst_h / src_h);
+
+	info.scale = r;
+	info.new_w = (int)std::round(src_w * r);
+	info.new_h = (int)std::round(src_h * r);
+
+	cv::Mat resized;
+	cv::resize(src, resized, cv::Size(info.new_w, info.new_h), 0, 0, cv::INTER_LINEAR);
+
+	int pad_w = dst_w - info.new_w;
+	int pad_h = dst_h - info.new_h;
+
+	info.pad_x = pad_w / 2;
+	info.pad_y = pad_h / 2;
+
+	cv::Mat out(dst_h, dst_w, src.type(), cv::Scalar(114, 114, 114));
+	resized.copyTo(out(cv::Rect(info.pad_x, info.pad_y, info.new_w, info.new_h)));
+	return out;
+}
+
+// BGR cv::Mat -> RGB float32 NCHW normalized
+static void matToCHW(const cv::Mat& img_bgr_letterboxed, std::vector<float>& chw) {
+	cv::Mat rgb;
+	cv::cvtColor(img_bgr_letterboxed, rgb, cv::COLOR_BGR2RGB);
+
+	cv::Mat f;
+	rgb.convertTo(f, CV_32F, 1.0 / 255.0);
+
+	int H = f.rows, W = f.cols;
+	chw.resize(3ull * H * W);
+
+	// HWC -> CHW
+	for (int y = 0; y < H; ++y) {
+		const cv::Vec3f* row = f.ptr<cv::Vec3f>(y);
+		for (int x = 0; x < W; ++x) {
+			const cv::Vec3f& p = row[x]; // RGB
+			chw[0ull * H * W + (size_t)y * W + x] = p[0];
+			chw[1ull * H * W + (size_t)y * W + x] = p[1];
+			chw[2ull * H * W + (size_t)y * W + x] = p[2];
+		}
+	}
+}
+
+struct RectInfo {
+	cv::Rect2f box;   // x,y,w,h in original image coords
+	int class_id = -1;
+	float score = 0.f;
+};
+
+static float IoU(const cv::Rect2f& a, const cv::Rect2f& b) {
+	float interArea = (a & b).area();
+	float unionArea = a.area() + b.area() - interArea;
+	return unionArea > 0.f ? interArea / unionArea : 0.f;
+}
+
+static std::vector<RectInfo> nms(const std::vector<RectInfo>& dets, float iouThresh) {
+	std::vector<int> idx(dets.size());
+	std::iota(idx.begin(), idx.end(), 0);
+
+	std::sort(idx.begin(), idx.end(), [&](int i, int j) {
+		return dets[i].score > dets[j].score;
+		});
+
+	std::vector<RectInfo> out;
+	std::vector<bool> suppressed(dets.size(), false);
+
+	for (size_t _i = 0; _i < idx.size(); ++_i) {
+		int i = idx[_i];
+		if (suppressed[i]) continue;
+		out.push_back(dets[i]);
+
+		for (size_t _j = _i + 1; _j < idx.size(); ++_j) {
+			int j = idx[_j];
+			if (suppressed[j]) continue;
+
+			// class-aware NMS (usually desired for YOLO)
+			if (dets[i].class_id != dets[j].class_id) continue;
+
+			if (IoU(dets[i].box, dets[j].box) > iouThresh) {
+				suppressed[j] = true;
+			}
+		}
+	}
+	return out;
+}
+
+static std::vector<RectInfo> decodeYoloV8_1xCxN(
+	const float* out,          // float pointer to output0
+	int C, int N,              // C=8, N=8400
+	int numClasses,            // 4 in your case
+	float confThresh,
+	const LetterboxInfo& lb,
+	int origW, int origH
+) {
+	std::vector<RectInfo> dets;
+	dets.reserve(256);
+
+	// out is arranged as [C, N] for your dims [1,C,N]
+	// index: out[c*N + i]
+	for (int i = 0; i < N; ++i) {
+		float x = out[0 * N + i];
+		float y = out[1 * N + i];
+		float w = out[2 * N + i];
+		float h = out[3 * N + i];
+
+		// class score = max over classes
+		int bestCls = -1;
+		float bestScore = 0.f;
+		for (int c = 0; c < numClasses; ++c) {
+			float s = out[(4 + c) * N + i];
+			if (s > bestScore) {
+				bestScore = s;
+				bestCls = c;
+			}
+		}
+
+		if (bestScore < confThresh) continue;
+
+		// xywh -> x1y1x2y2 in letterboxed input coords
+		float x1 = x - w * 0.5f;
+		float y1 = y - h * 0.5f;
+		float x2 = x + w * 0.5f;
+		float y2 = y + h * 0.5f;
+
+		// Undo letterbox: (coord - pad) / scale
+		x1 = (x1 - lb.pad_x) / lb.scale;
+		y1 = (y1 - lb.pad_y) / lb.scale;
+		x2 = (x2 - lb.pad_x) / lb.scale;
+		y2 = (y2 - lb.pad_y) / lb.scale;
+
+		// Clip to original image
+		x1 = std::max(0.f, std::min(x1, (float)(origW - 1)));
+		y1 = std::max(0.f, std::min(y1, (float)(origH - 1)));
+		x2 = std::max(0.f, std::min(x2, (float)(origW - 1)));
+		y2 = std::max(0.f, std::min(y2, (float)(origH - 1)));
+
+		float bw = x2 - x1;
+		float bh = y2 - y1;
+		if (bw <= 1.f || bh <= 1.f) continue;
+
+		RectInfo d;
+		d.box = cv::Rect2f(x1, y1, bw, bh);
+		d.class_id = bestCls;
+		d.score = bestScore;
+		dets.push_back(d);
+	}
+
+	return dets;
+}
+
+#pragma endregion
+
 auto controlConnected = false;
 auto dataConnected = false;
 
@@ -2237,6 +2823,187 @@ struct cloud_data
 /*
 * Point Cloud Operations
 */
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr singlePassThrough(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr pcInput,
+	float minX, float maxX,
+	float minY, float maxY,
+	float minZ, float maxZ,
+	pcl::PointCloud<pcl::PointXYZ>::Ptr pcResult)
+{
+	pcResult->clear();
+	for (const auto& point : pcInput->points)
+	{
+		if (point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY && point.z >= minZ && point.z <= maxZ)
+			pcResult->points.push_back(point);
+	}
+
+	pcResult->width = pcResult->points.size();
+	pcResult->height = 1;
+
+	return pcResult;
+}
+
+auto get_max_min_xyz(const pcl::PointCloud<pcl::PointXYZ>::Ptr input, int& minX, int& maxX, int& minY, int& maxY, int& minZ, int& maxZ) -> void
+{
+	int local_maxZ = -10000;
+	int local_minZ = 10000;
+	int local_maxX = -10000;
+	int local_minX = 10000;
+	int local_maxY = -10000;
+	int local_minY = 10000;
+	for (auto it = input->points.begin(); it < input->points.end(); ++it)
+	{
+		auto val = (*it).z;
+		if (val > local_maxZ)
+			local_maxZ = val;
+		if (val < local_minZ)
+			local_minZ = val;
+
+		auto valX = (*it).x;
+		if (valX > local_maxX)
+			local_maxX = valX;
+		if (valX < local_minX)
+			local_minX = valX;
+
+		auto valY = (*it).y;
+		if (valY > local_maxY)
+			local_maxY = valY;
+		if (valY < local_minY)
+			local_minY = valY;
+	}
+
+	maxZ = local_maxZ;
+	minZ = local_minZ;
+	maxX = local_maxX;
+	minX = local_minX;
+	maxY = local_maxY;
+	minY = local_minY;
+}
+/**
+ * @brief Find valid min or max value for a specified axis in a single pass
+ *
+ * @param input The input point cloud
+ * @param axis Which axis to process ('x', 'y', or 'z')
+ * @param find_max If true, finds max value; if false, finds min value
+ * @param window_size Size of the sliding window for density detection (in mm)
+ * @param min_points Minimum number of points required to consider a window valid
+ * @param outlier_min Lower bound for outlier rejection
+ * @param outlier_max Upper bound for outlier rejection
+ * @return int The valid min or max value for the specified axis
+ */
+auto get_valid_axis_value(
+	const pcl::PointCloud<pcl::PointXYZ>::Ptr& input,
+	char axis = 'y',
+	bool find_max = false,
+	float window_size = 40.0f,
+	int min_points = 30,
+	float outlier_min = -10000.0f,
+	float outlier_max = 10000.0f) -> int
+{
+	if (input->empty()) return -1;
+
+	// 1. Collect axis values in a single pass
+	std::vector<float> values;
+	values.reserve(input->size());
+	float global_min = outlier_max;
+	float global_max = outlier_min;
+
+	// Single pass through the point cloud
+	for (const auto& point : input->points)
+	{
+		float value;
+		// Select the appropriate coordinate based on axis parameter
+		switch (axis) {
+		case 'x': value = point.x; break;
+		case 'z': value = point.z; break;
+		case 'y':
+		default: value = point.y; break;
+		}
+
+		if (value > outlier_min && value < outlier_max)
+		{
+			values.push_back(value);
+			if (value < global_min) global_min = value;
+			if (value > global_max) global_max = value;
+		}
+	}
+
+	if (values.empty()) return -2;
+
+	// 2. Sort values for efficient window processing
+	std::sort(values.begin(), values.end());
+
+	// Default return value based on what we're looking for
+	int default_return = find_max ? static_cast<int>(global_max) : static_cast<int>(global_min);
+	//logMessage("Global Max: " + std::to_string(global_max) + " , Global Min: " + std::to_string(global_min) + " , values.size: " + std::to_string(values.size()));
+
+	// 3. Use sliding window to find dense region
+	if (find_max) {
+		// Find MAXIMUM: start from the end and work backwards
+		size_t window_start = values.size() - 1;
+		size_t window_end = values.size() - 1;
+
+		while (window_start > 0) {
+			// Expand window until it exceeds window_size
+			while (window_start > 0 &&
+				values[window_end] - values[window_start] <= window_size) {
+				window_start--;
+			}
+
+			// Adjust window_start if we went too far
+			if (values[window_end] - values[window_start] > window_size) {
+				window_start++;
+			}
+
+			// Check if current window has enough points
+			if (window_end - window_start + 1 >= min_points) {
+				// Calculate average of points in this window
+				float sum = 0.0f;
+				for (size_t i = window_start; i <= window_end; ++i) {
+					sum += values[i];
+				}
+				return static_cast<int>(sum / (window_end - window_start + 1));
+			}
+
+			// Move window end backward
+			if (window_end > 0) window_end--;
+		}
+	}
+	else {
+		// Find MINIMUM: start from the beginning and work forwards
+		size_t window_start = 0;
+		size_t window_end = 0;
+
+		while (window_end < values.size()) {
+			// Expand window until it exceeds window_size
+			while (window_end < values.size() &&
+				values[window_end] - values[window_start] <= window_size) {
+				window_end++;
+			}
+
+			// Check if current window has enough points
+			if (window_end - window_start >= min_points) {
+				// Calculate average of points in this window
+				float sum = 0.0f;
+				for (size_t i = window_start; i < window_end; ++i) {
+					sum += values[i];
+					//logMessage("i: " + std::to_string(i) + " value: " + std::to_string(values[i]));
+				}
+				//logMessage("Sum: " + std::to_string(sum) + " , Window End: " + std::to_string(window_end) + " , Window Start: " + std::to_string(window_start));
+				return static_cast<int>(sum / (window_end - window_start));
+			}
+
+			// Move window start forward
+			window_start++;
+		}
+	}
+
+	// Fallback to global min/max if no valid window found
+	return default_return;
+}
+
+
 
 bool pc_passThrough(pcl::PointCloud<pcl::PointXYZ>::Ptr pcInput,
 	float minV, float maxV, std::string axis, pcl::PointCloud<pcl::PointXYZ>::Ptr pcResult) {
@@ -2604,7 +3371,7 @@ auto get_valid_max_x(pcl::PointCloud<pcl::PointXYZ>::Ptr input) -> int
 	{
 		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 		auto val = pc_passThrough(input, cx - 40, cx, "x", slice_);
-		//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+		//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 		if (val)
 		{
 			if (slice_->points.size() > 30)
@@ -2636,7 +3403,7 @@ auto get_valid_min_x(pcl::PointCloud<pcl::PointXYZ>::Ptr input) -> int
 	{
 		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 		auto val = pc_passThrough(input, cx, cx + 40, "x", slice_);
-		//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+		//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 		if (val)
 		{
 			if (slice_->points.size() > 30)
@@ -2695,7 +3462,7 @@ auto get_valid_max_z(pcl::PointCloud<pcl::PointXYZ>::Ptr input) -> int
 	{
 		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 		auto val = pc_passThrough(input, cz - 40, cz, "z", slice_);
-		//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+		//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 		if (val)
 		{
 			if (slice_->points.size() > 30)
@@ -2727,7 +3494,7 @@ auto get_valid_min_z(pcl::PointCloud<pcl::PointXYZ>::Ptr input) -> int
 	{
 		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 		auto val = pc_passThrough(input, cz, cz + 40, "z", slice_);
-		//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+		//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 		if (val)
 		{
 			if (slice_->points.size() > 30)
@@ -2910,31 +3677,21 @@ auto map_box_to_pc_noisefiltertest(pcl::PointCloud<pcl::PointXYZ>::Ptr pointClou
 			}
 		}
 	}
-	if (save_path != "") pcl::io::savePLYFileBinary(save_path + "_no_filter" + std::to_string(res_cloud->points.size()) + ".ply", *res_cloud);
+	if (save_path != "") pcl::io::savePCDFileBinaryCompressed(save_path + "_no_filter" + std::to_string(res_cloud->points.size()) + ".pcd", *res_cloud);
 
 	//logMessage("map size: " + std::to_string(res_cloud->points.size()));
 	pcl::PointCloud<pcl::PointXYZ>::Ptr nf_out(new pcl::PointCloud <pcl::PointXYZ>);
 	int max_points = 0;
 	int nf_index = -1;
 	//nf1: 30, 0.1
-	pcl::PointCloud<pcl::PointXYZ>::Ptr nf_cloud1(new pcl::PointCloud <pcl::PointXYZ>);
-	nf_cloud1 = open3d_NoiseFilter(res_cloud, 30, 1.0);
-	if (save_path != "") pcl::io::savePLYFileBinary(save_path + "_nf30_1.0_pc_" + std::to_string(nf_cloud1->points.size()) + ".ply", *nf_cloud1);
-	if (nf_cloud1->points.size() > 0)
-	{
-		max_points = nf_cloud1->points.size();
-		pcl::copyPointCloud(*nf_cloud1, *nf_out);
-		nf_index = 1;
-	}
-	else
-	{
-		pcl::copyPointCloud(*res_cloud, *nf_out);
-		nf_index = 0;
-	}
+	//pcl::PointCloud<pcl::PointXYZ>::Ptr nf_cloud1(new pcl::PointCloud <pcl::PointXYZ>);
+	//nf_cloud1 = open3d_NoiseFilter(res_cloud, 30, 1.0);
+	//if (save_path != "") pcl::io::savePCDFileBinaryCompressed(save_path + "_nf30_1.0_pc_" + std::to_string(nf_cloud1->points.size()) + ".pcd", *nf_cloud1);
 
-	if (save_path != "") pcl::io::savePLYFileBinary(save_path + "_nf_out_i_" + std::to_string(nf_index) + ".ply", *nf_out);
 
-	return nf_out;
+	//if (save_path != "") pcl::io::savePCDFileBinaryCompressed(save_path + "_nf_out_i_" + std::to_string(nf_index) + ".pcd", *nf_out);
+
+	return res_cloud;// nf_out;
 }
 
 auto get_closest_xz(pcl::PointCloud<pcl::PointXYZ>::Ptr input, pcl::PointXYZ refPT) -> pcl::PointXYZ
@@ -2994,7 +3751,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr makePCL_PointCloud(pcl::PointCloud<pcl::Poin
 	//auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - dt_now).count();
 	//std::cout << "make dur ms: " << std::to_string(dur) << std::endl;
 
-	//pcl::io::savePLYFileBinary("temp.ply", *pointCloud);
+	//pcl::io::savePCDFileBinaryCompressed("temp.pcd", *pointCloud);
 	return pointCloud;
 }
 
@@ -3050,7 +3807,7 @@ pcl::PointXYZ pc_hole_detection(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInp
 		//logMessage("mostPoints z: " + std::to_string(mostPoints_z_slice->points.size()));
 		if (mostPoints_z_slice->points.size() > 0)
 		{
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_mostPointsZ_" + std::to_string(mostPoints_z_slice->points.size()) + ".ply", *mostPoints_z_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_mostPointsZ_" + std::to_string(mostPoints_z_slice->points.size()) + ".pcd", *mostPoints_z_slice);
 
 			//slice through y,
 			int maxY, minY;
@@ -3075,7 +3832,7 @@ pcl::PointXYZ pc_hole_detection(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInp
 				//slice through x,
 				if (slice_y->points.size() > 0)
 				{
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_mpz_slice_y_" + std::to_string(y_index) + ".ply", *slice_y);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_mpz_slice_y_" + std::to_string(y_index) + ".pcd", *slice_y);
 
 					int maxX, minX;
 					get_max_min_x(slice_y, ref(maxX), ref(minX));
@@ -3148,7 +3905,7 @@ pcl::PointXYZ pc_hole_detection(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInp
 				{
 					hole_center_points->points.push_back(pcl::PointXYZ(hc_x, minY, minZ));
 				}
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_center_points_count_" + std::to_string(hole_center_by_y.size()) + ".ply", *hole_center_points);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_center_points_count_" + std::to_string(hole_center_by_y.size()) + ".pcd", *hole_center_points);
 
 				double hole_center = static_cast<double>(std::accumulate(hole_center_by_y.begin(), hole_center_by_y.end(), 0)) / hole_center_by_y.size();
 
@@ -3210,89 +3967,100 @@ pcl::PointXYZ pc_hole_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 	{
 		//X-Z directional limit for bigger ROI.
 		int local_min_x, local_max_x;
-		int local_min_z, local_max_Z;
+		int local_min_y, local_max_y;
+		int local_min_z, local_max_z;
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_hole_filter_x(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_hole_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_hole_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		local_min_z = get_valid_axis_value(pcInput, 'z', false);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_hole_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			//max x
-			local_max_x = get_valid_max_x(pcInput);
-			auto val = pc_passThrough(pcInput, local_max_x - 200, local_max_x + 100, "x", init_hole_filter_x);
-			val = pc_passThrough(init_hole_filter_x, local_min_z - 100, local_min_z + 200, "z", init_hole_filtered);
-
+			local_max_x = get_valid_axis_value(pcInput, 'x', true);
+			singlePassThrough(pcInput, local_max_x - 200, local_max_x + 100, -10000, 10000, -10000, 10000, init_hole_filter_x);
+			singlePassThrough(init_hole_filter_x, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 200, init_hole_filtered);
 		}
 		else
 		{
 			//min x
-			local_min_x = get_valid_min_x(pcInput);
-			auto val = pc_passThrough(pcInput, local_min_x - 100, local_min_x + 200, "x", init_hole_filter_x);
-			val = pc_passThrough(init_hole_filter_x, local_min_z - 100, local_min_z + 200, "z", init_hole_filtered);
+			local_min_x = get_valid_axis_value(pcInput, 'x', false);
+			singlePassThrough(pcInput, local_min_x - 100, local_min_x + 200, -10000, 10000, -10000, 10000, init_hole_filter_x);
+			singlePassThrough(init_hole_filter_x, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 200, init_hole_filtered);
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_hole_filtered.ply", *init_hole_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_hole_filtered.pcd", *init_hole_filtered);
 
 		//Get Y slices :: 20 height slices.
 		//Cornercastings height = usually 120mm.
 
 		int y_slice_height = 20;
 
-		int minY, maxY;
-		get_max_min_y(init_hole_filtered, ref(maxY), ref(minY));
+		//int minY, maxY;
+		//get_max_min_y(init_hole_filtered, ref(maxY), ref(minY));
+		get_max_min_xyz(init_hole_filtered, ref(local_min_x), ref(local_max_x), ref(local_min_y), ref(local_max_y), ref(local_min_z), ref(local_max_z));
 
 		std::vector<pcl::PointXYZ> target_points = {};
 
 		int i = 0;
-		for (int cy = minY; cy < maxY; cy += y_slice_height)
+		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr sliceIntrim(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr mpz_slice(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr mpx_slice(new pcl::PointCloud<pcl::PointXYZ>);
+
+		for (int cy = local_min_y; cy < local_max_y; cy += y_slice_height)
 		{
-			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
-			auto val = pc_passThrough(init_hole_filtered, cy, cy + y_slice_height, "y", slice_);
-			//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
-			if (val)
+			singlePassThrough(init_hole_filtered, -10000, 10000, cy, cy + y_slice_height, -10000, 10000, slice_);
+			//auto val = pc_passThrough(init_hole_filtered, cy, cy + y_slice_height, "y", slice_);
+			//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
+			if (slice_->points.size() > 0)
 			{
 				//Get most points MinX and most points MinZ Slices
 
-				pcl::PointCloud<pcl::PointXYZ>::Ptr mpz_slice(new pcl::PointCloud<pcl::PointXYZ>);
-				pcl::PointCloud<pcl::PointXYZ>::Ptr mpx_slice(new pcl::PointCloud<pcl::PointXYZ>);
-
 				int slice_width = 20;
 
-				int minZ, maxZ, minX, maxX;
-				get_max_min_x(slice_, ref(maxX), ref(minX));
-				get_max_min_z(slice_, ref(maxZ), ref(minZ));
+				int l_minZ, l_maxZ, l_minX, l_maxX, l_minY, l_maxY;
+				get_max_min_xyz(slice_, ref(l_minX), ref(l_maxX), ref(l_minY), ref(l_maxY), ref(l_minZ), ref(l_maxZ));
 
-				for (int cx = minX; cx < maxX; cx += slice_width)
+				for (int cx = l_minX; cx < l_maxX; cx += slice_width)
 				{
-					pcl::PointCloud<pcl::PointXYZ>::Ptr sliceX_(new pcl::PointCloud<pcl::PointXYZ>);
-					auto valX = pc_passThrough(slice_, cx, cx + slice_width, "x", sliceX_);
-					if (sliceX_->points.size() > mpx_slice->points.size())
+					singlePassThrough(slice_, cx, cx + slice_width, -10000, 10000, -10000, 10000, sliceIntrim);
+					if (sliceIntrim->points.size() > mpx_slice->points.size())
 					{
-						pcl::copyPointCloud(*sliceX_, *mpx_slice);
+						pcl::copyPointCloud(*sliceIntrim, *mpx_slice);
 					}
 				}
 
-				for (int cz = minZ; cz < maxZ; cz += slice_width)
+				for (int cz = l_minZ; cz < l_maxZ; cz += slice_width)
 				{
-					pcl::PointCloud<pcl::PointXYZ>::Ptr sliceZ_(new pcl::PointCloud<pcl::PointXYZ>);
-					auto valZ = pc_passThrough(slice_, cz, cz + slice_width, "z", sliceZ_);
-					if (sliceZ_->points.size() > mpz_slice->points.size())
+					singlePassThrough(slice_, -10000, 10000, -10000, 10000, cz, cz + slice_width, sliceIntrim);
+					if (sliceIntrim->points.size() > mpz_slice->points.size())
 					{
-						pcl::copyPointCloud(*sliceZ_, *mpz_slice);
+						pcl::copyPointCloud(*sliceIntrim, *mpz_slice);
 					}
 				}
 				
-				//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_i_" + std::to_string(i) + "_mpx_" + std::to_string(mpx_slice->points.size()) + ".ply", *mpx_slice);
-				//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_i_" + std::to_string(i) + "_mpz_" + std::to_string(mpz_slice->points.size()) + ".ply", *mpz_slice);
+				//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_i_" + std::to_string(i) + "_mpx_" + std::to_string(mpx_slice->points.size()) + ".pcd", *mpx_slice);
+				//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_i_" + std::to_string(i) + "_mpz_" + std::to_string(mpz_slice->points.size()) + ".pcd", *mpz_slice);
 
 				//from minX slice, get minZ.
+				int mpx_minX = -10000, mpx_maxX = -10000;
+				int mpx_minY = -10000, mpx_maxY = -10000;
 				int mpx_minZ = -10000, mpx_maxZ = -10000;
-				if (mpx_slice->points.size() > 0) get_max_min_z(mpx_slice, ref(mpx_maxZ), ref(mpx_minZ));
+
+				if (mpx_slice->points.size() > 0)
+				{
+					get_max_min_xyz(mpx_slice, ref(mpx_minX), ref(mpx_maxX), ref(mpx_minY), ref(mpx_maxY), ref(mpx_minZ), ref(mpx_maxZ));
+				}
 
 				//from minZ slice, get minX.
 				int mpz_minX = -10000, mpz_maxX = -10000;
-				if (mpz_slice->points.size() > 0) get_max_min_x(mpz_slice, ref(mpz_maxX), ref(mpz_minX));
-				 
+				int mpz_minY = -10000, mpz_maxY = -10000;
+				int mpz_minZ = -10000, mpz_maxZ = -10000;
+
+				if (mpz_slice->points.size() > 0)
+				{
+					get_max_min_xyz(mpz_slice, ref(mpz_minX), ref(mpz_maxX), ref(mpz_minY), ref(mpz_maxY), ref(mpz_minZ), ref(mpz_maxZ));
+				}
 				//then get closest "actual" point to X,Z values.
 				if (!target_on_right)
 				{
@@ -3302,11 +4070,11 @@ pcl::PointXYZ pc_hole_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 						//Get Closest Point.
 						auto targetPt = get_closest_xz(init_hole_filtered, refPoint);
-						targetPt.y = cy;
+						targetPt.y = mpz_minY;
 
 						pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 						tPt->points.push_back(targetPt);
-						//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_targetPt_i_" + std::to_string(i) + ".ply", *tPt);
+						//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_targetPt_i_" + std::to_string(i) + ".pcd", *tPt);
 
 						target_points.push_back(targetPt);
 					}
@@ -3319,19 +4087,22 @@ pcl::PointXYZ pc_hole_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 						//Get Closest Point.
 						auto targetPt = get_closest_xz(init_hole_filtered, refPoint);
-						targetPt.y = cy;
+						targetPt.y = mpz_minY;
 
 						pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 						tPt->points.push_back(targetPt);
-						//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_targetPt_i_" + std::to_string(i) + ".ply", *tPt);
+						//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_targetPt_i_" + std::to_string(i) + ".pcd", *tPt);
 
 						target_points.push_back(targetPt);
 					}
 				}
 
-				
 			}
+
 			i++;
+
+			mpx_slice.reset(new pcl::PointCloud<pcl::PointXYZ>);
+			mpz_slice.reset(new pcl::PointCloud<pcl::PointXYZ>);
 		}
 
 		//based on target points.
@@ -3372,32 +4143,28 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 	{
 		//X-Z directional limit for bigger ROI.
 		int local_min_x, local_max_x;
-		int local_min_z, local_max_Z;
+		int local_min_y, local_max_y;
+		int local_min_z, local_max_z;
 		
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		local_min_z = get_valid_axis_value(pcInput, 'z', false, 40.0f, 30, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
-			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
-			//max x
-			local_max_x = get_valid_max_x(init_cone_filter_z);
-			val = pc_passThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, "x", init_cone_filtered);	
+			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			local_max_x = get_valid_axis_value(init_cone_filter_z, 'x', true);
+			singlePassThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
 		else
 		{
-			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
-			//min x
-			local_min_x = get_valid_min_x(pcInput);
-			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
-			
+			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			local_min_x = get_valid_axis_value(init_cone_filter_z, 'x', false);
+			singlePassThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_cone_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_cone_filtered.pcd", *init_cone_filtered);
 
-		get_max_min_x(init_cone_filtered, ref(local_max_x), ref(local_min_x));
-		get_max_min_z(init_cone_filtered, ref(local_max_Z), ref(local_min_z));
-
+		get_max_min_xyz(init_cone_filtered, ref(local_min_x), ref(local_max_x), ref(local_min_y), ref(local_max_y), ref(local_min_z), ref(local_max_z));
 
 		//slice through y direction with slice height = 20.
 
@@ -3408,19 +4175,17 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 		int y_slice_height = 30;
 
-		int minY, maxY;
-		get_max_min_y(init_cone_filtered, ref(maxY), ref(minY));
-
-		pcl::PointCloud<pcl::PointXYZ>::Ptr mpy_slice(new pcl::PointCloud<pcl::PointXYZ>);
-
 		int i = 0;
 		int most_points_i = -1;
-		for (int cy = maxY; cy > minY; cy -= y_slice_height)
+		pcl::PointCloud<pcl::PointXYZ>::Ptr mpy_slice(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
+
+
+		for (int cy = local_max_y; cy > local_min_y; cy -= y_slice_height)
 		{
-			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
-			auto val = pc_passThrough(init_cone_filtered, cy - y_slice_height, cy, "y", slice_);
-			//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
-			if (val)
+			singlePassThrough(init_cone_filtered, -10000, 10000, cy - y_slice_height, cy, -10000, 10000, slice_);
+			//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
+			if (slice_->points.size() > 0)
 			{
 				if (slice_->points.size() > mpy_slice->points.size())
 				{
@@ -3433,13 +4198,13 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 		if (most_points_i != -1)
 		{
-			int slice_max_y = maxY - y_slice_height * most_points_i;
+			int slice_max_y = local_max_y - y_slice_height * most_points_i;
 			int slice_min_y = slice_max_y - y_slice_height - 15;
 			slice_max_y += 15;
 
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
-			auto val = pc_passThrough(init_cone_filtered, slice_min_y, slice_max_y, "y", slice_);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_extended_slice_y_pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			singlePassThrough(init_cone_filtered, -10000, 10000, slice_min_y, slice_max_y, -10000, 10000, slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_extended_slice_y_pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (slice_->points.size() > mpy_slice->points.size())
 			{
 				pcl::copyPointCloud(*slice_, *mpy_slice);
@@ -3451,50 +4216,48 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			int slice_width = 20;
 			pcl::PointCloud<pcl::PointXYZ>::Ptr mpz_slice(new pcl::PointCloud<pcl::PointXYZ>);
 			pcl::PointCloud<pcl::PointXYZ>::Ptr mpx_slice(new pcl::PointCloud<pcl::PointXYZ>);
+			pcl::PointCloud<pcl::PointXYZ>::Ptr sliceIntrim(new pcl::PointCloud<pcl::PointXYZ>);
 
-			int minZ, maxZ, minX, maxX;
-			get_max_min_x(mpy_slice, ref(maxX), ref(minX));
-			get_max_min_z(mpy_slice, ref(maxZ), ref(minZ));
-
+			int minZ, maxZ, minX, maxX, minY, maxY;
+			get_max_min_xyz(mpy_slice, ref(minX), ref(maxX), ref(minY), ref(maxY), ref(minZ), ref(maxZ));
+			
 			for (int cx = minX; cx < maxX; cx += slice_width)
 			{
-				pcl::PointCloud<pcl::PointXYZ>::Ptr sliceX_(new pcl::PointCloud<pcl::PointXYZ>);
-				auto valX = pc_passThrough(mpy_slice, cx, cx + slice_width, "x", sliceX_);
-				if (sliceX_->points.size() > mpx_slice->points.size())
+				singlePassThrough(mpy_slice, cx, cx + slice_width, -10000, 10000, -10000, 10000, sliceIntrim);
+				if (sliceIntrim->points.size() > mpx_slice->points.size())
 				{
-					pcl::copyPointCloud(*sliceX_, *mpx_slice);
+					pcl::copyPointCloud(*sliceIntrim, *mpx_slice);
 				}
 			}
 
 			for (int cz = minZ; cz < maxZ; cz += slice_width)
 			{
-				pcl::PointCloud<pcl::PointXYZ>::Ptr sliceZ_(new pcl::PointCloud<pcl::PointXYZ>);
-				auto valZ = pc_passThrough(mpy_slice, cz, cz + slice_width, "z", sliceZ_);
-				if (sliceZ_->points.size() > mpz_slice->points.size())
+				singlePassThrough(mpy_slice, -10000, 10000, -10000, 10000, cz, cz + slice_width, sliceIntrim);
+				if (sliceIntrim->points.size() > mpz_slice->points.size())
 				{
-					pcl::copyPointCloud(*sliceZ_, *mpz_slice);
+					pcl::copyPointCloud(*sliceIntrim, *mpz_slice);
 				}
 			}
 
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_mpx_" + std::to_string(mpx_slice->points.size()) + ".ply", *mpx_slice);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_mpz_" + std::to_string(mpz_slice->points.size()) + ".ply", *mpz_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_mpx_" + std::to_string(mpx_slice->points.size()) + ".pcd", *mpx_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_mpz_" + std::to_string(mpz_slice->points.size()) + ".pcd", *mpz_slice);
 
 			//from minX slice, get minZ.
 			int mpx_minX = -10000, mpx_maxX = -10000;
 			int mpx_minZ = -10000, mpx_maxZ = -10000;
+			int mpx_minY = -10000, mpx_maxY = -10000;
 			if (mpx_slice->points.size() > 0)
 			{
-				get_max_min_x(mpx_slice, ref(mpx_maxX), ref(mpx_minX));
-				get_max_min_z(mpx_slice, ref(mpx_maxZ), ref(mpx_minZ));
+				get_max_min_xyz(mpx_slice, ref(mpx_minX), ref(mpx_maxX), ref(mpx_minY), ref(mpx_maxY), ref(mpx_minZ), ref(mpx_maxZ));
 			}
 
 			//from minZ slice, get minX.
 			int mpz_minX = -10000, mpz_maxX = -10000;
 			int mpz_minZ = -10000, mpz_maxZ = -10000;
+			int mpz_minY = -10000, mpz_maxY = -10000;
 			if (mpz_slice->points.size() > 0)
 			{
-				get_max_min_x(mpz_slice, ref(mpz_maxX), ref(mpz_minX));
-				get_max_min_z(mpz_slice, ref(mpz_maxZ), ref(mpz_minZ));
+				get_max_min_xyz(mpz_slice, ref(mpz_minX), ref(mpz_maxX), ref(mpz_minY), ref(mpz_maxY), ref(mpz_minZ), ref(mpz_maxZ));
 			}
 			//then get closest "actual" point to X,Z values.
 			if (!target_on_right)
@@ -3505,10 +4268,11 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
 					
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3519,10 +4283,11 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpx_minY;
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt_mpx.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpx.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3533,10 +4298,11 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt_mpz.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpz.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3549,10 +4315,11 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3563,10 +4330,11 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpx_minY;
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt_mpx.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpx.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3577,10 +4345,254 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 					//Get Closest Point.
 					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_targetPt_mpz.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpz.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+			}
+		}
+	}
+	catch (std::exception& ex)
+	{
+		logMessage("[PCA_CONE] " + std::string(ex.what()));
+		return pcl::PointXYZ(-10000, -10000, -10000);
+	}
+	catch (...)
+	{
+		logMessage("[PCA_CONE] Unknown Exception!");
+		return pcl::PointXYZ(-10000, -10000, -10000);
+	}
+
+	return cone_position;
+}
+
+pcl::PointXYZ pc_cone_detection_preset(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInput, bool target_on_right, MAX_MIN_RANGE presetRange, std::string save_path)
+{
+	pcl::PointXYZ cone_position(-10000, -10000, -10000);
+	try
+	{
+		//X-Z directional limit for bigger ROI.
+		int local_min_x, local_max_x;
+		int local_min_y, local_max_y;
+		int local_min_z, local_max_z;
+
+		//1. Preset Range로 먼저 Extract.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr preset_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		singlePassThrough(pcInput, presetRange.MIN, presetRange.MAX, HEIGHT_RANGE_MIN, HEIGHT_RANGE_MAX, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX, preset_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_preset_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+		if (save_path != std::string(""))
+		{
+			if (preset_cone_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(save_path + "_preset_cone.pcd", *preset_cone_filtered);
+		}
+
+		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
+		local_min_z = get_valid_axis_value(pcInput, 'z', false);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+		if (!target_on_right)
+		{
+			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			local_max_x = get_valid_axis_value(init_cone_filter_z, 'x', true);
+			singlePassThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, -10000, 10000, -10000, 10000, init_cone_filtered);
+		}
+		else
+		{
+			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			local_min_x = get_valid_axis_value(init_cone_filter_z, 'x', false);
+			singlePassThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, -10000, 10000, -10000, 10000, init_cone_filtered);
+		}
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_cone_filtered.pcd", *init_cone_filtered);
+
+		get_max_min_xyz(init_cone_filtered, ref(local_min_x), ref(local_max_x), ref(local_min_y), ref(local_max_y), ref(local_min_z), ref(local_max_z));
+
+		//slice through y direction with slice height = 20.
+
+		//Get most points y slice.
+		//In the process of finding most points y slice, check for increase in point count then decrease in point count?
+
+		//from most points y slice, slice through x,z for most points and look for target point.
+
+		int y_slice_height = 30;
+
+		int i = 0;
+		int most_points_i = -1;
+		pcl::PointCloud<pcl::PointXYZ>::Ptr mpy_slice(new pcl::PointCloud<pcl::PointXYZ>);
+		pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
+
+
+		for (int cy = local_max_y; cy > local_min_y; cy -= y_slice_height)
+		{
+			singlePassThrough(init_cone_filtered, -10000, 10000, cy - y_slice_height, cy, -10000, 10000, slice_);
+			//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
+			if (slice_->points.size() > 0)
+			{
+				if (slice_->points.size() > mpy_slice->points.size())
+				{
+					pcl::copyPointCloud(*slice_, *mpy_slice);
+					most_points_i = i;
+				}
+			}
+			i++;
+		}
+
+		if (most_points_i != -1)
+		{
+			int slice_max_y = local_max_y - y_slice_height * most_points_i;
+			int slice_min_y = slice_max_y - y_slice_height - 15;
+			slice_max_y += 15;
+
+			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
+			singlePassThrough(init_cone_filtered, -10000, 10000, slice_min_y, slice_max_y, -10000, 10000, slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_extended_slice_y_pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
+			if (slice_->points.size() > mpy_slice->points.size())
+			{
+				pcl::copyPointCloud(*slice_, *mpy_slice);
+			}
+		}
+
+		if (mpy_slice->points.size() > 0)
+		{
+			int slice_width = 20;
+			pcl::PointCloud<pcl::PointXYZ>::Ptr mpz_slice(new pcl::PointCloud<pcl::PointXYZ>);
+			pcl::PointCloud<pcl::PointXYZ>::Ptr mpx_slice(new pcl::PointCloud<pcl::PointXYZ>);
+			pcl::PointCloud<pcl::PointXYZ>::Ptr sliceIntrim(new pcl::PointCloud<pcl::PointXYZ>);
+
+			int minZ, maxZ, minX, maxX, minY, maxY;
+			get_max_min_xyz(mpy_slice, ref(minX), ref(maxX), ref(minY), ref(maxY), ref(minZ), ref(maxZ));
+
+			for (int cx = minX; cx < maxX; cx += slice_width)
+			{
+				singlePassThrough(mpy_slice, cx, cx + slice_width, -10000, 10000, -10000, 10000, sliceIntrim);
+				if (sliceIntrim->points.size() > mpx_slice->points.size())
+				{
+					pcl::copyPointCloud(*sliceIntrim, *mpx_slice);
+				}
+			}
+
+			for (int cz = minZ; cz < maxZ; cz += slice_width)
+			{
+				singlePassThrough(mpy_slice, -10000, 10000, -10000, 10000, cz, cz + slice_width, sliceIntrim);
+				if (sliceIntrim->points.size() > mpz_slice->points.size())
+				{
+					pcl::copyPointCloud(*sliceIntrim, *mpz_slice);
+				}
+			}
+
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_mpx_" + std::to_string(mpx_slice->points.size()) + ".pcd", *mpx_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_mpz_" + std::to_string(mpz_slice->points.size()) + ".pcd", *mpz_slice);
+
+			//from minX slice, get minZ.
+			int mpx_minX = -10000, mpx_maxX = -10000;
+			int mpx_minZ = -10000, mpx_maxZ = -10000;
+			int mpx_minY = -10000, mpx_maxY = -10000;
+			if (mpx_slice->points.size() > 0)
+			{
+				get_max_min_xyz(mpx_slice, ref(mpx_minX), ref(mpx_maxX), ref(mpx_minY), ref(mpx_maxY), ref(mpx_minZ), ref(mpx_maxZ));
+			}
+
+			//from minZ slice, get minX.
+			int mpz_minX = -10000, mpz_maxX = -10000;
+			int mpz_minZ = -10000, mpz_maxZ = -10000;
+			int mpz_minY = -10000, mpz_maxY = -10000;
+			if (mpz_slice->points.size() > 0)
+			{
+				get_max_min_xyz(mpz_slice, ref(mpz_minX), ref(mpz_maxX), ref(mpz_minY), ref(mpz_maxY), ref(mpz_minZ), ref(mpz_maxZ));
+			}
+			//then get closest "actual" point to X,Z values.
+			if (!target_on_right)
+			{
+				if (mpx_minZ != -10000 && mpz_maxX != -10000)
+				{
+					pcl::PointXYZ refPoint(mpz_maxX, 0, mpx_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+				else if (mpx_minZ != -10000 && mpz_maxX == -10000)
+				{
+					//use mpx slice to get minZ and maxX.
+					pcl::PointXYZ refPoint(mpx_maxX, 0, mpx_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpx_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpx.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+				else if (mpx_minZ == -10000 && mpz_maxX != -10000)
+				{
+					//use mpx slice to get minZ and maxX.
+					pcl::PointXYZ refPoint(mpz_maxX, 0, mpz_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpz.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+			}
+			else
+			{
+				if (mpx_minZ != -10000 && mpz_minX != -10000)
+				{
+					pcl::PointXYZ refPoint(mpz_minX, 0, mpx_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+				else if (mpx_minZ != -10000 && mpz_minX == -10000)
+				{
+					//use mpx slice to get minZ and maxX.
+					pcl::PointXYZ refPoint(mpx_minX, 0, mpx_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpx_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpx.pcd", *tPt);
+
+					cone_position = targetPt;
+				}
+				else if (mpx_minZ == -10000 && mpz_minX != -10000)
+				{
+					//use mpx slice to get minZ and maxX.
+					pcl::PointXYZ refPoint(mpz_minX, 0, mpz_minZ);
+
+					//Get Closest Point.
+					auto targetPt = get_closest_xz(mpy_slice, refPoint);
+					targetPt.y = mpz_minY;
+
+					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
+					tPt->points.push_back(targetPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_targetPt_mpz.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -3614,7 +4626,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
 		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_igh_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_igh_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 400, "z", init_cone_filter_z);
@@ -3630,7 +4642,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 400, "x", init_cone_filtered);
 
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_igh_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_igh_filtered.pcd", *init_cone_filtered);
 
 		get_max_min_x(init_cone_filtered, ref(local_max_x), ref(local_min_x));
 		get_max_min_z(init_cone_filtered, ref(local_max_Z), ref(local_min_z));
@@ -3647,7 +4659,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 		{
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 			auto val = pc_passThrough(init_cone_filtered, cz, cz + z_slice_depth, "z", slice_);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (val)
 			{
 				if (slice_->points.size() > mostPoints_z_slice->points.size())
@@ -3694,7 +4706,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx - x_slice_depth, cx, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -3720,7 +4732,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx, cx + x_slice_depth, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -3758,7 +4770,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3768,7 +4780,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3778,7 +4790,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3791,7 +4803,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3801,7 +4813,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3811,7 +4823,7 @@ pcl::PointXYZ pc_IGH_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3842,7 +4854,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
 		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_ighs_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_ighs_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
@@ -3858,7 +4870,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
 
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_ighs_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_ighs_filtered.pcd", *init_cone_filtered);
 
 		get_max_min_x(init_cone_filtered, ref(local_max_x), ref(local_min_x));
 		get_max_min_z(init_cone_filtered, ref(local_max_Z), ref(local_min_z));
@@ -3875,7 +4887,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 		{
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 			auto val = pc_passThrough(init_cone_filtered, cz, cz + z_slice_depth, "z", slice_);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (val)
 			{
 				if (slice_->points.size() > mostPoints_z_slice->points.size())
@@ -3922,7 +4934,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx - x_slice_depth, cx, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -3948,7 +4960,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx, cx + x_slice_depth, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -3986,7 +4998,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -3996,7 +5008,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4006,7 +5018,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4019,7 +5031,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4029,7 +5041,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4039,7 +5051,7 @@ pcl::PointXYZ pc_IGHS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4071,7 +5083,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
 		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_land_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_land_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
@@ -4089,7 +5101,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
 
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_land_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_land_filtered.pcd", *init_cone_filtered);
 		//Get mpx, mpz slices
 		int slice_width = 20;
 		pcl::PointCloud<pcl::PointXYZ>::Ptr mpz_slice(new pcl::PointCloud<pcl::PointXYZ>);
@@ -4120,8 +5132,8 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 			}
 		}
 
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_mpx_" + std::to_string(mpx_slice->points.size()) + ".ply", *mpx_slice);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_mpz_" + std::to_string(mpz_slice->points.size()) + ".ply", *mpz_slice);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_mpx_" + std::to_string(mpx_slice->points.size()) + ".pcd", *mpx_slice);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_mpz_" + std::to_string(mpz_slice->points.size()) + ".pcd", *mpz_slice);
 
 		//from minX slice, get minZ.
 		int mpx_minX = -10000, mpx_maxX = -10000;
@@ -4153,7 +5165,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4168,7 +5180,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt_mpx.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt_mpx.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4183,7 +5195,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt_mpz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt_mpz.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4200,7 +5212,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4215,7 +5227,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt_mpx.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt_mpx.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4230,7 +5242,7 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(targetPt);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_targetPt_mpz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_targetPt_mpz.pcd", *tPt);
 
 				cone_position = targetPt;
 			}
@@ -4262,7 +5274,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
 		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_CSTS_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_CSTS_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
@@ -4278,7 +5290,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
 
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_CSTS_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_CSTS_filtered.pcd", *init_cone_filtered);
 
 		get_max_min_x(init_cone_filtered, ref(local_max_x), ref(local_min_x));
 		get_max_min_z(init_cone_filtered, ref(local_max_Z), ref(local_min_z));
@@ -4295,7 +5307,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 		{
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 			auto val = pc_passThrough(init_cone_filtered, cz, cz + z_slice_depth, "z", slice_);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_slice_z_i_" + std::to_string(z) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (val)
 			{
 				if (slice_->points.size() > mostPoints_z_slice->points.size())
@@ -4342,7 +5354,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx - x_slice_depth, cx, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -4368,7 +5380,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 				auto val = pc_passThrough(init_cone_filtered, cx, cx + x_slice_depth, "x", slice_);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_slice_x_i_" + std::to_string(x) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 				if (val)
 				{
 					if (slice_->points.size() > mostPoints_x_slice->points.size())
@@ -4406,7 +5418,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4416,7 +5428,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4426,7 +5438,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4439,7 +5451,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_xz.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_xz.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4449,7 +5461,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_z.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_z.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4459,7 +5471,7 @@ pcl::PointXYZ pc_CSTS_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 				pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 				tPt->points.push_back(refPoint);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_CSTS_targetPt_x.ply", *tPt);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_CSTS_targetPt_x.pcd", *tPt);
 
 				cone_position = refPoint;
 			}
@@ -4492,7 +5504,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
 		local_min_z = get_valid_min_z(pcInput);
 		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pre_init_guide_" + std::to_string(local_min_z) + ".ply", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_guide_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
 			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
@@ -4508,7 +5520,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
 
 		}
-		if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_init_guide_filtered.ply", *init_cone_filtered);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_guide_filtered.pcd", *init_cone_filtered);
 
 
 		get_max_min_x(init_cone_filtered, ref(local_max_x), ref(local_min_x));
@@ -4535,7 +5547,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 		{
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 			auto val = pc_passThrough(init_cone_filtered, cy - y_slice_height, cy, "y", slice_);
-			//if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			//if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_slice_y_i_" + std::to_string(i) + "pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (val)
 			{
 				if (slice_->points.size() > mpy_slice->points.size())
@@ -4555,7 +5567,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 			pcl::PointCloud<pcl::PointXYZ>::Ptr slice_(new pcl::PointCloud<pcl::PointXYZ>);
 			auto val = pc_passThrough(init_cone_filtered, slice_min_y, slice_max_y, "y", slice_);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_extended_slice_y_pc_" + std::to_string(slice_->points.size()) + ".ply", *slice_);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_extended_slice_y_pc_" + std::to_string(slice_->points.size()) + ".pcd", *slice_);
 			if (slice_->points.size() > mpy_slice->points.size())
 			{
 				pcl::copyPointCloud(*slice_, *mpy_slice);
@@ -4592,8 +5604,8 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 				}
 			}
 
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_mpx_" + std::to_string(mpx_slice->points.size()) + ".ply", *mpx_slice);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_mpz_" + std::to_string(mpz_slice->points.size()) + ".ply", *mpz_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_mpx_" + std::to_string(mpx_slice->points.size()) + ".pcd", *mpx_slice);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_mpz_" + std::to_string(mpz_slice->points.size()) + ".pcd", *mpz_slice);
 
 			//from minX slice, get minZ.
 			int mpx_minX = -10000, mpx_maxX = -10000;
@@ -4624,7 +5636,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4638,7 +5650,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt_mpx.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt_mpx.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4652,7 +5664,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt_mpz.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt_mpz.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4668,7 +5680,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4682,7 +5694,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt_mpx.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt_mpx.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4696,7 +5708,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr tPt(new pcl::PointCloud<pcl::PointXYZ>);
 					tPt->points.push_back(targetPt);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_targetPt_mpz.ply", *tPt);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_targetPt_mpz.pcd", *tPt);
 
 					cone_position = targetPt;
 				}
@@ -4719,6 +5731,28 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 
 //PointCloud :: Guide Detection
+static inline void drawDottedLine(cv::Mat& img, cv::Point p1, cv::Point p2,
+	const cv::Scalar& color, int radius = 2, int gap = 8)
+{
+	cv::LineIterator it(img, p1, p2, 8);
+	for (int i = 0; i < it.count; i += gap) {
+		cv::circle(img, it.pos(), radius, color, cv::FILLED, cv::LINE_AA);
+	}
+}
+
+static inline void drawDottedRect(cv::Mat& img, const cv::Rect& r,
+	const cv::Scalar& color, int radius = 2, int gap = 8)
+{
+	cv::Point tl = r.tl();
+	cv::Point tr(r.x + r.width, r.y);
+	cv::Point br(r.x + r.width, r.y + r.height);
+	cv::Point bl(r.x, r.y + r.height);
+
+	drawDottedLine(img, tl, tr, color, radius, gap);
+	drawDottedLine(img, tr, br, color, radius, gap);
+	drawDottedLine(img, br, bl, color, radius, gap);
+	drawDottedLine(img, bl, tl, color, radius, gap);
+}
 
 cv::Mat drawOnImage(cv::Mat input, std::vector<rectangle_info> det_results)
 {
@@ -4808,6 +5842,59 @@ cv::Mat drawOnImage(cv::Mat input, std::vector<Detection> det_results)
 
 	return result_image;
 }
+cv::Mat drawOnImage(cv::Mat input, std::vector<RectInfo> det_results)
+{
+	cv::Mat result_image = input.clone();
+
+	for (auto& it : det_results)
+	{
+		bbx box;
+		box.index = it.class_id;
+		box.label = class_names[box.index];
+
+		box.x = (int)it.box.x;
+		box.y = (int)it.box.y;
+
+		box.center_x = (int)(it.box.x + it.box.width / 2);
+		box.center_y = (int)(it.box.y + it.box.height / 2);
+
+		box.w = (int)it.box.width;
+		box.h = (int)it.box.height;
+
+		box.prob = (int)(it.score * 100);
+
+		cv::Scalar clr(0, 0, 255);
+		bool target_check = true;
+		if (!target_check)
+		{
+			if (box.index == 1) clr = cv::Scalar(0, 255, 0);
+			else if (box.index == 2) clr = cv::Scalar(255, 0, 0);
+			else if (box.index == 3) clr = cv::Scalar(128, 128, 0);
+		}
+		else
+		{
+			//black.
+			clr = cv::Scalar(0, 0, 0);
+
+		}
+		cv::rectangle(result_image, cv::Rect(box.x, box.y, box.w, box.h), clr);
+
+
+		if (!target_check)
+		{
+			//put-text
+			std::string label = box.label + "," + std::to_string(round(box.prob)) + "%";
+			cv::putText(result_image, label, cv::Point(box.x, box.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
+		}
+		else
+		{
+			std::string label = box.label + "," + std::to_string(round(box.prob)) + "%";
+			cv::putText(result_image, label, cv::Point(box.x, box.y), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 1);
+		}
+	}
+
+	return result_image;
+}
 bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCloud<pcl::PointXYZ> pointCloud, std::string msg, std::chrono::system_clock::time_point frameTime)
 {
 	try {
@@ -4829,8 +5916,8 @@ bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCl
 			if (!oImage.empty()) cv::imwrite(SaveOImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_oImage.jpg", oImage);
 			if (!resImage.empty()) cv::imwrite(SaveResImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_resImage.jpg", resImage);
 
-			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_Depth.ply";
-			if (pointCloud.points.size() > 0) pcl::io::savePLYFileBinary(plyFilePath.c_str(), pointCloud);
+			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_Depth.pcd";
+			if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);	
 		}
 		else
 		{
@@ -4844,8 +5931,10 @@ bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCl
 			if (!oImage.empty()) cv::imwrite(SaveImageDir + "/" + timeNow + "_TMini_" + pos + "_Image.jpg", oImage);
 			//-----------------------------------------------
 			// Write point cloud to PLY
-			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_TMini_" + pos + "_Depth.ply";
-			if (pointCloud.points.size() > 0) pcl::io::savePLYFileBinary(plyFilePath.c_str(), pointCloud);
+
+			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_TMini_" + pos + "_Depth.pcd";
+			if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
+			
 			//std::printf("Writing frame to %s\n", plyFilePath);
 			//PointCloudPlyWriter::WriteFormatPLY(plyFilePath.c_str(), pointCloud, intensityMap, true);
 			//std::printf("Finished writing frame to %s\n", plyFilePath);
@@ -4860,7 +5949,8 @@ bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCl
 	}
 }
 
-void data_save_thread()
+/*
+void data_save_thread_deprecated()
 {
 	logMessage("Data Logging Thread Activated");
 	try
@@ -4927,6 +6017,67 @@ void data_save_thread()
 	{
 		logMessage("[Data-Save-Thread] Unknown Exception!");
 	}	
+}
+*/
+
+void data_save_thread()
+{
+	logMessage("Data Logging Thread Activated");
+
+	SaveTask task;
+	while (logging_running.load())
+	{
+		// Blocks when empty; wakes on push(); exits cleanly on tsq.stop()
+		if (!tsq.pop(task)) break;
+
+		try
+		{
+			// cloud is a pointer; dereference only when calling save
+			if (!task.cloud) {
+				logMessage("[Data-Save-Thread] Null cloud pointer, skipping.");
+				continue;
+			}
+
+			bool ok = save_to_drive(
+				task.isJobLog,
+				task.oImage,
+				task.resImage,
+				*task.cloud,
+				task.msg,
+				task.frameTime
+			);
+
+			if (!ok)
+				logMessage("[Data-Save-Thread] Failed to save data to drive!");
+			// Consider rate-limiting success logs if high FPS
+			// else logMessage("[Data-Save-Thread] Saved: " + task.msg);
+		}
+		catch (const std::exception& ex)
+		{
+			logMessage(std::string("[Data-Save-Thread] ") + ex.what());
+		}
+		catch (...)
+		{
+			logMessage("[Data-Save-Thread] Unknown Exception!");
+		}
+
+		// Optional: batch-drain a few queued items to reduce lock wakeups
+		for (int i = 0; i < 5 && logging_running.load(); ++i) {
+			SaveTask t2;
+			if (!tsq.try_pop(t2)) break;
+
+			try {
+				if (!t2.cloud) continue;
+				bool ok = save_to_drive(t2.isJobLog, t2.oImage, t2.resImage, *t2.cloud, t2.msg, t2.frameTime);
+				if (!ok) logMessage("[Data-Save-Thread] Failed to save data to drive!");
+			}
+			catch (...) {
+				logMessage("[Data-Save-Thread] Exception while batch saving.");
+			}
+		}
+	}
+
+	logMessage("Data Logging Thread Deactivated");
 }
 
 auto tmini_setup() -> bool
@@ -5119,7 +6270,7 @@ auto tmini_data_stream() -> void
 		while (tmini_data_stream_flag)
 		{
 			auto waitDur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - last_frame_get_time).count();
-			if (waitDur_ms > 200)
+			if (waitDur_ms > 150)
 			{
 				blnGetNewFrame = false;
 				bool stepComplete = visionaryControl.stepAcquisition();
@@ -5184,13 +6335,23 @@ auto tmini_data_stream() -> void
 
 							if (true)
 							{
-								logMessage("Data stack updating stack with new data...");
+								//logMessage("Data stack updating stack with new data...");
 								auto res = dataStack.Update_Stack(grayToClr, *pclPointCloud, last_frame_get_time);
-								if (res) logMessage("Data Stack Updated Successfully!");
-								else logMessage("Data Stack Update Failed!");
+								//if (res) logMessage("Data Stack Updated Successfully!");
+								//else logMessage("Data Stack Update Failed!");
 
 								if (enable_stream)
 								{
+
+									if (ENABLE_PRESET_VISUAL_ON_STREAM)
+									{
+										auto presetBox = current_job_info.presetBox;
+										auto line = std::string(std::to_string(presetBox.x) + "," + std::to_string(presetBox.y) + "," + std::to_string(presetBox.w) + "," + std::to_string(presetBox.h));
+										
+										cv::putText(grayToClr, line, cv::Point(10, 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+										drawDottedRect(grayToClr, cv::Rect(presetBox.x, presetBox.y, presetBox.w, presetBox.h), cv::Scalar(0, 0, 255), 1, 10);
+									}
+
 									cv::imshow(CURRENT_SENSOR_POSITION + " T Mini", grayToClr);
 									cv::waitKey(1);
 								}
@@ -5595,6 +6756,107 @@ bool yolo_inference(YOLO11Detector& detector, cv::Mat image, cv::Mat& res_image,
 	catch (...)
 	{
 		logMessage("[ONNX-Inference] Unknown Exception!");
+		return false;
+	}
+}
+
+bool trt_inference(TrtRunner& detector, cv::Mat image, cv::Mat& res_image, std::vector<rectangle_info>& det_results, std::vector<std::vector<bbx>>& det_sorted_objects, int& det_count, std::string save_path = "", bool debugMode = false, bool jobLog = false)
+{
+	try
+	{
+		bool status_return = true;
+		if (image.empty())
+		{
+			logMessage("[ONNX-Inference] Image is empty!");
+			return false;
+		}
+		det_sorted_objects = std::vector<std::vector<bbx>>(class_names.size(), std::vector<bbx>(0));
+
+		//Image Inference
+		det_results = {};
+		
+		auto start = std::chrono::high_resolution_clock::now();
+		// Perform detection with the updated thresholds
+		LetterboxInfo lb;
+		cv::Mat in = letterbox(image, 640, 640, lb);
+		std::vector<float> inputCHW;
+		matToCHW(in, inputCHW);
+
+		size_t inputBytes = inputCHW.size() * sizeof(float);
+
+		if (!detector.infer("images", inputCHW.data(), inputBytes)) {
+			logMessage("Trt Inference failed here");
+		}
+
+		auto outs = detector.outputs();
+		logMessage("Got %zu output tensors " + std::to_string(outs.size()));
+
+		const auto& out0 = outs.at(0);
+
+		// out0.host is bytes; convert to float pointer
+		const float* pred = reinterpret_cast<const float*>(out0.host.data());
+
+		// dims: [1,8,8400]
+		int C = out0.dims.d[1];   // 8
+		int N = out0.dims.d[2];   // 8400
+		int numClasses = C - 4;   // 4
+
+		//float confThresh = 0.25f;
+		//float iouThresh = 0.45f;
+
+		std::vector<RectInfo> dets = decodeYoloV8_1xCxN(
+			pred, C, N, numClasses, confThreshold,
+			lb, image.cols, image.rows
+		);
+
+		std::vector<RectInfo> finalDets = nms(dets, iouThreshold);
+
+		auto stop_ts = std::chrono::high_resolution_clock::now();
+		logMessage("Trt Inference time: " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(stop_ts - start).count()));
+
+		det_count = 0;
+		for (auto& it : finalDets)
+		{
+			if (it.score * 100 < PROB_LIMIT)
+			{
+				//logMessage("Get rid of this object: " + std::to_string(it.classId) + " at prob: " + std::to_string(it.conf * 100));
+				continue;
+			}
+
+			bbx box;
+			box.index = it.class_id;
+			box.label = class_names[box.index];
+
+			box.x = (int)it.box.x;
+			box.y = (int)it.box.y;
+
+			box.center_x = (int)(it.box.x + it.box.width / 2);
+			box.center_y = (int)(it.box.y + it.box.height / 2);
+
+			box.w = (int)it.box.width;
+			box.h = (int)it.box.height;
+
+			box.prob = (int)(it.score * 100);
+
+			det_count++;
+			det_sorted_objects.at(box.index).push_back(box);
+
+			if (jobLog) jobLogMessage("Det Object: " + std::to_string(box.index) + "," + box.label + "," + std::to_string(box.x) + "," + std::to_string(box.y) + "," + std::to_string(box.w) + "," + std::to_string(box.h) + "," + std::to_string(box.prob));
+			if (debugMode) logMessage("Det Object: " + std::to_string(box.index) + "," + box.label + "," + std::to_string(box.x) + "," + std::to_string(box.y) + "," + std::to_string(box.w) + "," + std::to_string(box.h) + "," + std::to_string(box.prob));
+		}
+
+		if (save_path != std::string("")) res_image = drawOnImage(image, finalDets);
+
+		if (det_count == 0) status_return = false;
+	}
+	catch (std::exception& ex)
+	{
+		logMessage("[Trt-Inference] " + std::string(ex.what()));
+		return false;
+	}
+	catch (...)
+	{
+		logMessage("[Trt-Inference] Unknown Exception!");
 		return false;
 	}
 }
@@ -6528,10 +7790,6 @@ bool clps_detection_va(std::string ChassisType, bbx target_hole, bbx target_cone
 }
 
 
-
-
-
-
 bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bbx target_hole, bbx target_cone, bbx target_guide, bool sprd_landed, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcHole, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcCone, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcGuide, std::string save_path = "", bool jobLog = false)
 {
 	try
@@ -6541,7 +7799,7 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 			std::string bPath = (save_path != std::string("")) ? save_path + "_Hole" : "";
 			//logMessage(std::to_string(target_hole.x) + " " + std::to_string(target_hole.y) + " , " + std::to_string(x_limit) + " , " + std::to_string(z_limit));
 			pcHole = map_box_to_pc_noisefiltertest(pointCloud, target_hole, 0, 0, bPath);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcHole.ply", *pcHole);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcHole.pcd", *pcHole);
 		}
 		if (target_cone.prob > 0)
 		{
@@ -6549,7 +7807,7 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 			{
 				std::string bPath = (save_path != std::string("")) ? save_path + "_Cone" : "";
 				pcCone = map_box_to_pc_noisefiltertest(pointCloud, target_cone, 0, 0, bPath);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcCone.ply", *pcCone);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcCone.pcd", *pcCone);
 			}
 			else if (target_cone.index == 2)
 			{
@@ -6558,7 +7816,7 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 				{
 					std::string bPath = (save_path != std::string("")) ? save_path + "_PreLanded" : "";
 					auto pcPreCone = map_box_to_pc_noisefiltertest(pointCloud, target_cone, 0, 0, bPath);
-					if (save_path != std::string(""))pcl::io::savePLYFileBinary(save_path + "_pcPreLanded.ply", *pcCone);
+					if (save_path != std::string(""))pcl::io::savePCDFileBinaryCompressed(save_path + "_pcPreLanded.pcd", *pcCone);
 
 					bbx modified_landed = target_cone;
 					auto delta_y = target_hole.y + target_hole.h - target_cone.y;
@@ -6567,13 +7825,13 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 
 					std::string bPath2 = (save_path != std::string("")) ? save_path + "_Landed" : "";
 					pcCone = map_box_to_pc_noisefiltertest(pointCloud, modified_landed, 0, 0, bPath2);
-					if (save_path != std::string(""))pcl::io::savePLYFileBinary(save_path + "_pcLanded.ply", *pcCone);
+					if (save_path != std::string(""))pcl::io::savePCDFileBinaryCompressed(save_path + "_pcLanded.pcd", *pcCone);
 				}
 				else
 				{
 					std::string bPath = (save_path != std::string("")) ? save_path + "_PreLanded" : "";
 					auto pcPreCone = map_box_to_pc_noisefiltertest(pointCloud, target_cone, 0, 0, bPath);
-					if (save_path != std::string(""))pcl::io::savePLYFileBinary(save_path + "_pcPreLanded.ply", *pcCone);
+					if (save_path != std::string(""))pcl::io::savePCDFileBinaryCompressed(save_path + "_pcPreLanded.pcd", *pcCone);
 
 					//preset y down?
 					int preset_y_hole = 20;
@@ -6582,27 +7840,27 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 					modified_landed.h = target_cone.h - preset_y_hole;
 					std::string bPath2 = (save_path != std::string("")) ? save_path + "_Landed" : "";
 					pcCone = map_box_to_pc_noisefiltertest(pointCloud, modified_landed, 0, 0, bPath2);
-					if (save_path != std::string(""))pcl::io::savePLYFileBinary(save_path + "_pcLanded_preset.ply", *pcCone);
+					if (save_path != std::string(""))pcl::io::savePCDFileBinaryCompressed(save_path + "_pcLanded_preset.pcd", *pcCone);
 				}
 			}
 			else if (target_cone.index == 3 || target_cone.index == 4)
 			{
 				std::string bPath = (save_path != std::string("")) ? save_path + "_IGH" : "";
 				pcCone = map_box_to_pc_noisefiltertest(pointCloud, target_cone, 0, 0, bPath);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcIGH.ply", *pcCone);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcIGH.pcd", *pcCone);
 			}
 			else if (target_cone.index == 5 || target_cone.index == 6 || target_cone.index == 7)
 			{
 				std::string bPath = (save_path != std::string("")) ? save_path + "_CST" : "";
 				pcCone = map_box_to_pc_noisefiltertest(pointCloud, target_cone, 0, 0, bPath);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcCST.ply", *pcCone);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcCST.pcd", *pcCone);
 			}
 		}	
 		if (target_guide.prob > 0)
 		{
 			std::string bPath = (save_path != std::string("")) ? save_path + "_Guide" : "";
 			pcGuide = map_box_to_pc_noisefiltertest(pointCloud, target_guide, 0, 0, bPath);
-			if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcGuide.ply", *pcGuide);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcGuide.pcd", *pcGuide);
 		}
 
 		if (jobLog) jobLogMessage("pcHole count: " + std::to_string(pcHole->points.size()));
@@ -6623,7 +7881,118 @@ bool target_pointcloud_extraction(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud
 	}
 }
 
-bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::string ChassisType, bbx target_hole, bbx target_cone, bbx target_guide, pcl::PointCloud<pcl::PointXYZ>::Ptr pcHole, pcl::PointCloud<pcl::PointXYZ>::Ptr pcCone, pcl::PointCloud<pcl::PointXYZ>::Ptr pcGuide, pcl::PointXYZ& hole_pos, pcl::PointXYZ& cone_pos, pcl::PointXYZ& guide_pos, std::string save_path = "", bool jobLog = false)
+bool target_pointcloud_extraction_preset(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, MAX_MIN_RANGE GRange, MAX_MIN_RANGE HRange, MAX_MIN_RANGE TRange, bool sprd_landed, bool usePreset_CC, bbx target_hole, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcHole, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcCone, pcl::PointCloud<pcl::PointXYZ>::Ptr& pcGuide, std::string save_path = "", bool jobLog = false)
+{
+	try
+	{
+		//Step1: PassThrough via ini set ROI.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pt_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+		singlePassThrough(pointCloud, GRange.MIN, GRange.MAX, HRange.MIN, HRange.MAX, TRange.MIN, TRange.MAX, pt_cloud);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_preset_pt.pcd", *pt_cloud);
+
+		//Step2: Voxelize pointcloud
+		pcl::PointCloud<pcl::PointXYZ>::Ptr vx_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+		pc_VoxelDown(pt_cloud, 10.f, 10.f, 10.f, vx_cloud);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_preset_vx.pcd", *vx_cloud);
+
+		//Step3: Clustering pointcloud
+		pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+		tree->setInputCloud(vx_cloud);
+
+		std::vector<pcl::PointIndices> cluster_indices;
+		pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+		ec.setClusterTolerance(20.f);   // mm
+		ec.setMinClusterSize(100);
+		ec.setMaxClusterSize(25000);
+		ec.setSearchMethod(tree);
+		ec.setInputCloud(vx_cloud);
+		ec.extract(cluster_indices);
+
+		int extra_range = 10, i = 0;
+		std::vector<pcl::PointCloud<pcl::PointXYZ>> extracted_clusters;
+		for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin(); it != cluster_indices.end(); ++it)
+		{
+			pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_cluster(new pcl::PointCloud<pcl::PointXYZ>);
+			for (std::vector<int>::const_iterator pit = it->indices.begin(); pit != it->indices.end(); ++pit)
+			{
+				cloud_cluster->points.push_back(vx_cloud->points[*pit]);
+			}
+			//extracted_clusters.push_back(*cloud_cluster);
+
+			int c_max_x = 0, c_min_x = 0, c_max_y = 0, c_min_y = 0, c_max_z = 0, c_min_z = 0;
+			auto center = get_center_of_cloud(*cloud_cluster, c_max_x, c_min_x, c_max_y, c_min_y, c_max_z, c_min_z);
+			pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_extrated(new pcl::PointCloud<pcl::PointXYZ>);
+			singlePassThrough(pt_cloud, c_min_x - extra_range, c_max_x + extra_range, c_min_y, c_max_y, c_min_z - extra_range, c_max_z + extra_range, cloud_extrated);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_preset_cluster_" + std::to_string(i) + ".pcd", *cloud_extrated);
+
+			extracted_clusters.push_back(*cloud_extrated);
+			i++;
+		}
+
+		//Step4: Consider biggest two only.
+		if (extracted_clusters.size() >= 2)
+		{
+			auto ec1 = extracted_clusters.at(0);
+			auto ec2 = extracted_clusters.at(1);
+
+			pcl::PointCloud<pcl::PointXYZ>::Ptr pcClust1(new pcl::PointCloud<pcl::PointXYZ>);
+			pcl::PointCloud<pcl::PointXYZ>::Ptr pcClust2(new pcl::PointCloud<pcl::PointXYZ>);
+
+			*pcClust1 = ec1;
+			*pcClust2 = ec2;
+			
+			int ec1_max_y, ec1_min_y;
+			get_max_min_y(pcClust1, ec1_max_y, ec1_min_y);
+			int ec1_center_y = ec1_min_y + (ec1_max_y - ec1_min_y) / 2;
+			int ec2_max_y, ec2_min_y;
+			get_max_min_y(pcClust2, ec2_max_y, ec2_min_y);
+			int ec2_center_y = ec2_min_y + (ec2_max_y - ec2_min_y) / 2;
+
+			if (ec1_center_y > ec2_center_y)
+			{
+				pcl::copyPointCloud(ec1, *pcHole);
+				pcl::copyPointCloud(ec2, *pcCone);
+			}
+			else
+			{
+				pcl::copyPointCloud(ec2, *pcHole);
+				pcl::copyPointCloud(ec1, *pcCone);
+			}
+
+			if (usePreset_CC) if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcHole.pcd", *pcHole);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcCone.pcd", *pcCone);
+		}
+		else if (extracted_clusters.size() == 1)
+		{
+			pcl::copyPointCloud(extracted_clusters.at(0), *pcCone);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcCone.pcd", *pcCone);
+		}
+
+		if (!usePreset_CC)
+		{
+			std::string bPath = (save_path != std::string("")) ? save_path + "_Hole" : "";
+			//logMessage(std::to_string(target_hole.x) + " " + std::to_string(target_hole.y) + " , " + std::to_string(x_limit) + " , " + std::to_string(z_limit));
+			pcHole = map_box_to_pc_noisefiltertest(pointCloud, target_hole, 0, 0, bPath);
+			if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcHole.pcd", *pcHole);
+		}
+
+		return true;
+	}
+	catch (std::exception& ex)
+	{
+		logMessage("[Target-PointCloud-Extraction] " + std::string(ex.what()));
+		return false;
+	}
+	catch (...)
+	{
+		logMessage("[Target-PointCloud-Extraction] Unknown Exception!");
+		return false;
+	}
+}
+
+
+
+bool position_detection_pca(JobInfo jobInfo, bool usePreset, bool isFrontSensor, bool target_on_right, std::string ChassisType, bbx target_hole, bbx target_cone, bbx target_guide, pcl::PointCloud<pcl::PointXYZ>::Ptr pcHole, pcl::PointCloud<pcl::PointXYZ>::Ptr pcCone, pcl::PointCloud<pcl::PointXYZ>::Ptr pcGuide, pcl::PointXYZ& hole_pos, pcl::PointXYZ& cone_pos, pcl::PointXYZ& guide_pos, std::string save_path = "", bool jobLog = false)
 {
 	try
 	{
@@ -6637,7 +8006,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr holeCloud(new pcl::PointCloud <pcl::PointXYZ>);
 				holeCloud->points.push_back(hole_pos);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_hole_pos.ply", *holeCloud);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_hole_pos.pcd", *holeCloud);
 			}
 		}
 
@@ -6645,15 +8014,23 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 		{
 			if (target_cone.index == 1)
 			{
-				cone_pos = pc_cone_detection_naive(pcCone, target_on_right, save_path);
+				if (usePreset)
+				{
+					//preset용 logic -- can be XT or landed.
+					cone_pos = pc_cone_detection_preset(pcCone, target_on_right, jobInfo.presetRangeX, save_path);
+				}
+				else
+				{
+					cone_pos = pc_cone_detection_naive(pcCone, target_on_right, save_path);
+				}
 				logMessage("Detected cone position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 				if (jobLog) jobLogMessage("Detected cone position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 
-				if (cone_pos.x != -10000)
+				if (cone_pos.x != -10000 && save_path != std::string(""))
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cone_pos.ply", *coneCloud);
+					pcl::io::savePCDFileBinaryCompressed(save_path + "_cone_pos.pcd", *coneCloud);
 				}
 			}
 			else if (target_cone.index == 2)
@@ -6666,7 +8043,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_landed_pos.ply", *coneCloud);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_landed_pos.pcd", *coneCloud);
 				}
 			}
 			//IGH
@@ -6680,7 +8057,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_igh_pos.ply", *coneCloud);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_igh_pos.pcd", *coneCloud);
 				}
 			}
 			//IGHS
@@ -6694,7 +8071,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_ighs_pos.ply", *coneCloud);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_ighs_pos.pcd", *coneCloud);
 				}
 			}
 			//CSTF
@@ -6708,7 +8085,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cstf_pos.ply", *coneCloud);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cstf_pos.pcd", *coneCloud);
 				}
 			}
 			//CSTB
@@ -6722,7 +8099,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 				{
 					pcl::PointCloud<pcl::PointXYZ>::Ptr coneCloud(new pcl::PointCloud <pcl::PointXYZ>);
 					coneCloud->points.push_back(cone_pos);
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_cstb_pos.ply", *coneCloud);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_cstb_pos.pcd", *coneCloud);
 				}
 			}
 		}
@@ -6738,7 +8115,7 @@ bool position_detection_pca(bool isFrontSensor, bool target_on_right, std::strin
 			{
 				pcl::PointCloud<pcl::PointXYZ>::Ptr guideCloud(new pcl::PointCloud <pcl::PointXYZ>);
 				guideCloud->points.push_back(guide_pos);
-				if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_guide_pos.ply", *guideCloud);
+				if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_guide_pos.pcd", *guideCloud);
 			}
 		}
 
@@ -6790,15 +8167,15 @@ bool CLPS_Detection_PCA_Only(pcl::PointCloud<pcl::PointXYZ>::Ptr pointcloud, boo
 			int z_max_limit = 4000;
 
 			pc_passThrough(pointcloud, x_min_limit, x_max_limit, y_min_limit, y_max_limit, z_min_limit, z_max_limit, pcPassThrough);
-			if (savePath != std::string("") && pcPassThrough->points.size() > 0) pcl::io::savePLYFileBinary(savePath + "_pcPassThrough.ply", *pcPassThrough);
+			if (savePath != std::string("") && pcPassThrough->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_pcPassThrough.pcd", *pcPassThrough);
 
 			//step2: Noise filter
 			pc_NoiseFilter(pcPassThrough, 30, 0.7, pcNoiseFilter);
-			if (savePath != std::string("") && pcNoiseFilter->points.size() > 0) pcl::io::savePLYFileBinary(savePath + "_pcNoiseFilter.ply", *pcNoiseFilter);
+			if (savePath != std::string("") && pcNoiseFilter->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_pcNoiseFilter.pcd", *pcNoiseFilter);
 
 			//step3: Voxel Down Filter
 			pc_VoxelDown(pcNoiseFilter, 50.0f, 50.0f, 50.0f, pcVoxel);
-			if (savePath != std::string("") && pcVoxel->points.size() > 0) pcl::io::savePLYFileBinary(savePath + "_pcVoxel.ply", *pcVoxel);
+			if (savePath != std::string("") && pcVoxel->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_pcVoxel.pcd", *pcVoxel);
 
 			//step4: clustering
 #pragma region Clustering
@@ -6854,7 +8231,7 @@ bool CLPS_Detection_PCA_Only(pcl::PointCloud<pcl::PointXYZ>::Ptr pointcloud, boo
 				//auto cloud_extract_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cloud_extract_Endtime - cloud_extract_time);
 				//leave_a_message(log_heading + "Cloud extract algorithm= " + std::to_string(cloud_extract_duration.count()) + "msec", std::chrono::system_clock::now());
 
-				if (savePath != std::string(""))pcl::io::savePLYFileBinary(savePath + "_cluster_" + std::to_string(i) + ".ply", *cloud_cluster);
+				if (savePath != std::string(""))pcl::io::savePCDFileBinaryCompressed(savePath + "_cluster_" + std::to_string(i) + ".pcd", *cloud_cluster);
 				i++;
 			}
 
@@ -6892,8 +8269,8 @@ bool CLPS_Detection_PCA_Only(pcl::PointCloud<pcl::PointXYZ>::Ptr pointcloud, boo
 					auto container_cluster = two_biggest_clusters.at(0);
 					auto chassis_cluster = two_biggest_clusters.at(1);
 
-					if (savePath != std::string(""))pcl::io::savePLYFileBinary(savePath + "_container_clust.ply", *container_cluster.pc_ptr);
-					if (savePath != std::string(""))pcl::io::savePLYFileBinary(savePath + "_chassis_clust.ply", *chassis_cluster.pc_ptr);
+					if (savePath != std::string(""))pcl::io::savePCDFileBinaryCompressed(savePath + "_container_clust.pcd", *container_cluster.pc_ptr);
+					if (savePath != std::string(""))pcl::io::savePCDFileBinaryCompressed(savePath + "_chassis_clust.pcd", *chassis_cluster.pc_ptr);
 
 					devY = static_cast<int>(container_cluster.min_y - chassis_cluster.max_y);
 					if (devY > 200)
@@ -6995,7 +8372,7 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 					//then extract.
 					pcl::PointCloud<pcl::PointXYZ>::Ptr pcHoleBeneath(new pcl::PointCloud<pcl::PointXYZ>);
 					pcHoleBeneath = map_box_to_pc(pointCloud, targetRegion);
-					//if (save_path != std::string(""))pcl::io::savePLYFileBinary(save_path + "_pcHoleBeneath.ply", *pcHoleBeneath);
+					//if (save_path != std::string(""))pcl::io::savePCDFileBinaryCompressed(save_path + "_pcHoleBeneath.pcd", *pcHoleBeneath);
 
 					//Do a pre filter 
 					pcl::PointCloud<pcl::PointXYZ>::Ptr pcFilterZ(new pcl::PointCloud <pcl::PointXYZ>);
@@ -7010,7 +8387,7 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 						pc_passThrough(pcTargetBase, hole_pos.x - 200, hole_pos.x + 200, "x", pcTargetBase);
 					}
 
-					if (save_path != std::string("")) pcl::io::savePLYFileBinary(save_path + "_pcHoleBeneath_Target_" + std::to_string(pcTargetBase->points.size()) + ".ply", *pcTargetBase);
+					if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pcHoleBeneath_Target_" + std::to_string(pcTargetBase->points.size()) + ".pcd", *pcTargetBase);
 
 					pcUnderHole = pcTargetBase->points.size();
 
@@ -7101,8 +8478,6 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 		return false;
 	}
 }
-
-
 
 bool Pre_Land_Chassis_Position_PCA(bbx target_cone, pcl::PointXYZ cone_pos, pcl::PointCloud<pcl::PointXYZ>::Ptr pcCone, bool jobLog = false)
 {
@@ -7375,9 +8750,12 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	int det_count = 0;
 	std::vector<rectangle_info> det_results;
 	std::vector<std::vector<bbx>> det_sorted_objects(class_names.size(), std::vector<bbx>(0));
-	auto inference_status = yolo_inference(yolo_detector, image, ref(res_image), ref(det_results), ref(det_sorted_objects), ref(det_count), savePath);
+	auto inference_status = trt_inference(trt_detector, image, ref(res_image), ref(det_results), ref(det_sorted_objects), ref(det_count), savePath);
 	
 	//Intrim variables
+	bool usePreset = false;
+	bool usePreset_CC = false;
+
 	bool _detected_hole = false, _detected_cone = false;
 	std::string _detected_chassis_type = "";
 
@@ -7392,7 +8770,6 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 	bool _landout_detected = false;
 	bool _clps_detected = false, _clps_ok_detected = false;
-
 
 	//For now; PCA only with VA-Mapping.
 	pcl::PointCloud<pcl::PointXYZ>::Ptr _pcHole(new pcl::PointCloud <pcl::PointXYZ>);
@@ -7435,7 +8812,7 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			cv::rectangle(res_image, cv::Rect(_target_hole.x, _target_hole.y, _target_hole.w, _target_hole.h), clr);
 
 			//put-text
-			std::string label = _target_hole.label + "," + std::to_string(_target_hole.prob) + "%";
+			std::string label = _target_hole.label + "," + std::to_string((int)_target_hole.prob) + "%";
 			cv::putText(res_image, label, cv::Point(_target_hole.x, _target_hole.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
 		}
 		if (_target_cone.prob > 0)
@@ -7445,7 +8822,7 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			cv::rectangle(res_image, cv::Rect(_target_cone.x, _target_cone.y, _target_cone.w, _target_cone.h), clr);
 
 			//put-text
-			std::string label = _target_cone.label + "," + std::to_string(_target_cone.prob) + "%";
+			std::string label = _target_cone.label + "," + std::to_string((int)_target_cone.prob) + "%";
 			cv::putText(res_image, label, cv::Point(_target_cone.x, _target_cone.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
 		}
 		if (_target_guide.prob > 0)
@@ -7455,7 +8832,7 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			cv::rectangle(res_image, cv::Rect(_target_guide.x, _target_guide.y, _target_guide.w, _target_guide.h), clr);
 
 			//put-text
-			std::string label = _target_guide.label + "," + std::to_string(_target_guide.prob) + "%";
+			std::string label = _target_guide.label + "," + std::to_string((int)_target_guide.prob) + "%";
 			cv::putText(res_image, label, cv::Point(_target_guide.x, _target_guide.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
 		}
 
@@ -7515,18 +8892,60 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	
 	}
 
+	if (_target_hole.prob == 0)
+	{
+		usePreset_CC = true;
+	}
 	if (_target_cone.prob == 0)
 	{
+		usePreset = true;
 		_target_cone = jobInfo.presetBox;
+		_target_cone.prob = 50;
+
+		if (jobInfo.chassisType == "XT") _target_cone.index = 1;
+		else if (jobInfo.chassisType == "IGH") _target_cone.index = 3;
+		else if (jobInfo.chassisType == "CST") 
+		{
+			_target_guide = _target_cone;
+			_target_cone = bbx();
+			_target_guide.index = 6;
+		}
+
 		logMessage("Using preset VA.");
+
+		//Cone: Pink.
+		cv::Scalar clr = cv::Scalar(203, 192, 255);
+		if (_target_cone.prob >= 50)
+		{
+			cv::rectangle(res_image, cv::Rect(_target_cone.x, _target_cone.y, _target_cone.w, _target_cone.h), clr);
+
+			//put-text
+			std::string label = _target_cone.label + "," + std::to_string((int)_target_cone.prob) + "%";
+			cv::putText(res_image, label, cv::Point(_target_cone.x, _target_cone.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
+		}
+		else if (_target_guide.prob >= 50)
+		{
+			cv::rectangle(res_image, cv::Rect(_target_guide.x, _target_guide.y, _target_guide.w, _target_guide.h), clr);
+
+			//put-text
+			std::string label = _target_guide.label + "," + std::to_string((int)_target_guide.prob) + "%";
+			cv::putText(res_image, label, cv::Point(_target_guide.x, _target_guide.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, clr, 2);
+		}
 	}
 
 #pragma region Target pointcloud extraction via VA-Based
-	target_pointcloud_extraction(pointCloud, _target_hole, _target_cone, _target_guide, _sprd_landed_trigger, ref(_pcHole), ref(_pcCone), ref(_pcGuide), savePath);
+	if (usePreset)
+	{
+		target_pointcloud_extraction_preset(pointCloud, jobInfo.presetRangeX, HEIGHT_MMR, TROLLEY_MMR, _sprd_landed_trigger, usePreset_CC, _target_hole, ref(_pcHole), ref(_pcCone), ref(_pcGuide), savePath);
+	}
+	else
+	{
+		target_pointcloud_extraction(pointCloud, _target_hole, _target_cone, _target_guide, _sprd_landed_trigger, ref(_pcHole), ref(_pcCone), ref(_pcGuide), savePath);
+	}
 #pragma endregion
 
 #pragma region PCA - Hole, Cone detection
-	position_detection_pca(isFrontSensor, target_on_right, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _pcHole, _pcCone, _pcGuide, ref(_hole_pos), ref(_cone_pos), ref(_guide_pos), savePath);
+	position_detection_pca(jobInfo, usePreset, isFrontSensor, target_on_right, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _pcHole, _pcCone, _pcGuide, ref(_hole_pos), ref(_cone_pos), ref(_guide_pos), savePath);
 #pragma endregion
 
 #pragma region dev_out_in pca -- landout/clps included.
@@ -7673,7 +9092,7 @@ void processingThread()
 					int frame_index = 0;
 
 					//printf("Process starting.\n");
-					auto check_interval = 100;
+					auto check_interval = 200;
 					auto last_dt_checked = std::chrono::system_clock::now();
 
 					bool dataStackReady = false;
@@ -7735,44 +9154,43 @@ void processingThread()
 										std::string msg2 = save_trigger_by_landed ? "LANDED" : "LANDOFF";
 										msg = msg + std::string("_") + msg2;
 
-										auto dataTup = std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, bool, std::string, std::chrono::system_clock::time_point>(img, res_img, *pcPointCloud, true, msg, ts);
-										tsq.push(dataTup);
+										SaveTask dataTask(img, res_img, pcPointCloud, true, std::move(msg), ts);
+										tsq.push(std::move(dataTask));
 
 										if (save_trigger_by_landed) save_trigger_by_landed = false;
 										if (save_trigger_by_TWL_Locked) save_trigger_by_TWL_Locked = false;
 									}
 									else if (enable_logging)
 									{
-
-										//save data to queue with copied data.
-										cv::Mat saveMat = img.clone();
-										pcl::PointCloud<pcl::PointXYZ> savePointCloud;
-										pcl::copyPointCloud(pointCloud, savePointCloud);
-
-										auto dataTup = std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, bool, std::string, std::chrono::system_clock::time_point>(saveMat, cv::Mat(), savePointCloud, false, "", last_frame_get_time);
-										tsq.push(dataTup);
+										SaveTask dataTask(img, cv::Mat(), pcPointCloud, false, std::string{}, last_frame_get_time);
+										tsq.push(std::move(dataTask));
 									}
 
-									//Process here.
-									bool isFrontSensor = (CURRENT_SENSOR_POSITION == "FRONT") ? true : false;
-									auto pre_pointCloud = makePCL_PointCloud(*pcPointCloud, DEBUG_CONVERT_PCL_RANGE);
-
-									auto pointCloud = pointCloud_tilt_transform(pre_pointCloud, TILT_ANGLE_DEG);
-									//pcl::io::savePLYFileBinary(save_path + "_base_converted.ply", *pointCloud);
-
-									current_process_results = ProcessLogic(isFrontSensor, current_job_info, img, pointCloud, std::string(""), false, false, ref(log_lines));
-
-									Simfile.open(sim_result_txt.c_str(), ios::out | ios::app);
-									if (!Simfile.is_open())
+									if (!ENABLE_IMAGE_LOGGING_ONLY)
 									{
-										logMessage("Failed to open file?");
-									}
-									if (Simfile.is_open())
-									{
-										Simfile << log_lines + "\n";
-										Simfile.close();
+										//Process here.
+										bool isFrontSensor = (CURRENT_SENSOR_POSITION == "FRONT") ? true : false;
+										auto pre_pointCloud = makePCL_PointCloud(*pcPointCloud, DEBUG_CONVERT_PCL_RANGE);
+
+										auto pointCloud = pointCloud_tilt_transform(pre_pointCloud, TILT_ANGLE_DEG);
+										//pcl::io::savePCDFileBinaryCompressed(save_path + "_base_converted.pcd", *pointCloud);
+
+										current_process_results = ProcessLogic(isFrontSensor, current_job_info, img, pointCloud, std::string(""), false, false, ref(log_lines));
+
+										Simfile.open(sim_result_txt.c_str(), ios::out | ios::app);
+										if (!Simfile.is_open())
+										{
+											logMessage("Failed to open file?");
+										}
+										if (Simfile.is_open())
+										{
+											Simfile << log_lines + "\n";
+											Simfile.close();
+										}
 									}
 								}	
+
+								std::this_thread::sleep_for(std::chrono::milliseconds(10));
 							}
 							else
 							{
@@ -7853,15 +9271,21 @@ void OfflineDebugBatchProcessingThread()
 
 		logMessage("Processing: " + jobDir);
 
-		//load .jpg, .ply files for processing
+		//load .jpg, .pcd files for processing
 		auto image_filePath = jobDir + "/" + std::string("Image");
 		auto depth_filePath = jobDir + "/" + std::string("Depth");
 
 		std::filesystem::path pathObj = std::filesystem::path(jobDir).lexically_normal();
 		std::string lastDirectory = pathObj.filename().string();
 
+		bool loadedPLY = false;
 		auto image_files = getAllFiles(image_filePath, ".jpg");
-		auto depth_files = getAllFiles(depth_filePath, ".ply");
+		auto depth_files = getAllFiles(depth_filePath, ".pcd");
+		if (depth_files.size() == 0) 
+		{
+			depth_files = getAllFiles(depth_filePath, ".ply"); 
+			loadedPLY = true;
+		}
 
 		createDirectory_ifexists(DEBUG_BATCH_SAVE_DIR);
 		auto save_file_path = DEBUG_BATCH_SAVE_DIR + "/" + lastDirectory;
@@ -7928,37 +9352,41 @@ void OfflineDebugBatchProcessingThread()
 		}
 
 		bbx presetTarget;
+		MAX_MIN_RANGE presetTargetX;
 		//PRESET SELECT
 		if (DEBUG_SENSOR_POSITION == "FRONT")
 		{
 			if (chs_type == "XT")
 			{
-				if (chs_size == 45 && sprd_size == 40) presetTarget = presetPos.F_CONE_4X_R;
-				else if (chs_size == 45 && job_pos == "Small") presetTarget = presetPos.F_CONE_20_R;
-				else if (chs_size == 40 && job_pos == "Small") presetTarget = presetPos.F_CONE_20_F;
+				if (chs_size == 45 && sprd_size == 40) { presetTarget = presetPos.F_CONE_4X_R; presetTargetX = presetPos.F_XT_4XR_RNG; }
+				else if (chs_size == 45 && job_pos == "Small") { presetTarget = presetPos.F_CONE_20_R;  presetTargetX = presetPos.F_XT_20R_RNG;}
+				else if (chs_size == 40 && job_pos == "Small") { presetTarget = presetPos.F_CONE_20_F;  presetTargetX = presetPos.F_XT_20F_RNG;}
 				else
 				{
 					presetTarget = presetPos.F_CONE_4X_F;
+					presetTargetX = presetPos.F_XT_4XF_RNG;
 				}
 			}
 			else if (chs_type == "IGH")
 			{
-				if (chs_size == 45 && sprd_size == 40) presetTarget = presetPos.F_IGH_4X_R;
-				else if (chs_size == 45 && job_pos == "Small") presetTarget = presetPos.F_IGH_20_R;
-				else if (chs_size == 40 && job_pos == "Small") presetTarget = presetPos.F_IGH_20_F;
+				if (chs_size == 45 && sprd_size == 40) { presetTarget = presetPos.F_IGH_4X_R; presetTargetX = presetPos.F_IGH_4XR_RNG; }
+				else if (chs_size == 45 && job_pos == "Small") { presetTarget = presetPos.F_IGH_20_R;  presetTargetX = presetPos.F_IGH_20R_RNG; }
+				else if (chs_size == 40 && job_pos == "Small") { presetTarget = presetPos.F_IGH_20_F;  presetTargetX = presetPos.F_IGH_20F_RNG; }
 				else
 				{
 					presetTarget = presetPos.F_IGH_4X_F;
+					presetTargetX = presetPos.F_IGH_4XF_RNG;
 				}
 			}
 			else if (chs_type == "CST")
 			{
-				if (chs_size == 45 && sprd_size == 40) presetTarget = presetPos.F_CST_4X_R;
-				else if (chs_size == 45 && job_pos == "Small") presetTarget = presetPos.F_CST_20_R;
-				else if (chs_size == 40 && job_pos == "Small") presetTarget = presetPos.F_CST_20_F;
+				if (chs_size == 45 && sprd_size == 40) { presetTarget = presetPos.F_CST_4X_R; presetTargetX = presetPos.F_CST_4XR_RNG; }
+				else if (chs_size == 45 && job_pos == "Small") { presetTarget = presetPos.F_CST_20_R;  presetTargetX = presetPos.F_CST_20R_RNG; }
+				else if (chs_size == 40 && job_pos == "Small") { presetTarget = presetPos.F_CST_20_F;  presetTargetX = presetPos.F_CST_20F_RNG; }
 				else
 				{
 					presetTarget = presetPos.F_CST_4X_F;
+					presetTargetX = presetPos.F_CST_4XF_RNG;
 				}
 			}
 		}
@@ -7966,27 +9394,27 @@ void OfflineDebugBatchProcessingThread()
 		{
 			if (chs_type == "XT")
 			{
-				if (job_pos == "Big") presetTarget = presetPos.R_CONE_20_F;
-				else if (chs_size == 40) presetTarget = presetPos.R_CONE_4X_F;
-				else presetTarget = presetPos.R_CONE_4X_R;
+				if (job_pos == "Big") { presetTarget = presetPos.R_CONE_20_F; presetTargetX = presetPos.R_XT_20F_RNG; }
+				else if (chs_size == 40) { presetTarget = presetPos.R_CONE_4X_F; presetTargetX = presetPos.R_XT_4XF_RNG;}
+				else { presetTarget = presetPos.R_CONE_4X_R; presetTargetX = presetPos.R_XT_4XR_RNG;}
 			}
 			else if (chs_type == "IGH")
 			{
-				if (job_pos == "Big") presetTarget = presetPos.R_IGH_20_F;
-				else if (chs_size == 40) presetTarget = presetPos.R_IGH_4X_F;
-				else presetTarget = presetPos.R_IGH_4X_R;
+				if (job_pos == "Big") { presetTarget = presetPos.R_IGH_20_F; presetTargetX = presetPos.R_IGH_20F_RNG; }
+				else if (chs_size == 40) { presetTarget = presetPos.R_IGH_4X_F; presetTargetX = presetPos.R_IGH_4XF_RNG; }
+				else { presetTarget = presetPos.R_IGH_4X_R; presetTargetX = presetPos.R_IGH_4XR_RNG; }
 			}
 			else if (chs_type == "CST")
 			{
-				if (job_pos == "Big") presetTarget = presetPos.R_CST_20_F;
-				else if (chs_size == 40) presetTarget = presetPos.R_CST_4X_F;
-				else presetTarget = presetPos.R_CST_4X_R;
+				if (job_pos == "Big") { presetTarget = presetPos.R_CST_20_F; presetTargetX = presetPos.R_CST_20F_RNG; }
+				else if (chs_size == 40) { presetTarget = presetPos.R_CST_4X_F; presetTargetX = presetPos.R_CST_4XF_RNG; }
+				else { presetTarget = presetPos.R_CST_4X_R; presetTargetX = presetPos.R_CST_4XR_RNG; }
 			}
 		}
 
 
 		JobInfo currentJobInfo;
-		currentJobInfo.set(Mount_Cycle, Offload_Cycle, job_pos, chs_type, chs_size, sprd_size, presetTarget);
+		currentJobInfo.set(Mount_Cycle, Offload_Cycle, job_pos, chs_type, chs_size, sprd_size, presetTarget, presetTargetX);
 
 
 		IDEAL_POS IP;
@@ -8035,17 +9463,28 @@ void OfflineDebugBatchProcessingThread()
 				continue;
 			}
 
-			//load ply
 			pcl::PointCloud<pcl::PointXYZ>::Ptr pcData = std::make_shared<pcl::PointCloud <pcl::PointXYZ>>();
-			if (pcl::io::loadPLYFile<pcl::PointXYZ>(depth_files.at(i), *pcData) == -1)
+			if (loadedPLY)
 			{
-				std::cout << std::string("Couldn't read file by PLY ") << std::endl;
-				//return false;
+				//load ply
+				if (pcl::io::loadPLYFile<pcl::PointXYZ>(depth_files.at(i), *pcData) == -1)
+				{
+					std::cout << std::string("Couldn't read file by PLY ") << std::endl;
+					//return false;
+				}
+			}
+			else
+			{
+				if (pcl::io::loadPCDFile<pcl::PointXYZ>(depth_files.at(i), *pcData) == -1)
+				{
+					std::cout << std::string("Couldn't read file by PCD ") << std::endl;
+					//return false;
+				}
 			}
 			auto pre_pointCloud = makePCL_PointCloud(*pcData, DEBUG_CONVERT_PCL_RANGE);
 
 			auto pointCloud = pointCloud_tilt_transform(pre_pointCloud, TILT_ANGLE_DEG);
-			pcl::io::savePLYFileBinary(save_path + "_base_converted.ply", *pointCloud);
+			pcl::io::savePCDFileBinaryCompressed(save_path + "_base_converted.pcd", *pointCloud);
 			
 			ProcessResults procRes = ProcessLogic(isFrontSensor, currentJobInfo, image, pointCloud, save_path, false, true, ref(log_lines));
 			
@@ -8123,8 +9562,6 @@ void OfflineDebugBatchProcessingThread()
 		Simfile_batch.close();
 	}
 }
-
-
 
 void handleClient(SOCKET clientSocket) {
 	logMessage("Client connected. Sending initial message...");
@@ -8360,9 +9797,88 @@ int main(int argc, char* argv[])
 	parseProcessINI(app_path);
 	parseIPINI(app_path);
 
-	//YOLOv11
-	bool useGPU = true;
+	//TensorRT
+	if (!ENABLE_IMAGE_LOGGING_ONLY)
+	{
+		try {
+			if (!trt_detector.loadEngine("model/20251201_TUAS_SEndfeed_3DSP.engine")) {
+				printf("loadEngine failed\n");
+			}
 
+			std::string imagePath = app_path + "/initialize.jpg";
+			cv::Mat frame = cv::imread(imagePath);
+
+			LetterboxInfo lb;
+			cv::Mat in = letterbox(frame, 640, 640, lb);
+
+			std::vector<float> inputCHW;
+			matToCHW(in, inputCHW);
+
+			size_t inputBytes = inputCHW.size() * sizeof(float);
+
+			if (!trt_detector.infer("images", inputCHW.data(), inputBytes)) {
+				printf("infer failed\n");
+				return 1;
+			}
+
+			auto outs = trt_detector.outputs();
+			printf("Got %zu output tensors\n", outs.size());
+			for (auto& o : outs) {
+				printf("Output %s bytes=%zu dims=[", o.name.c_str(), o.bytes);
+				for (int i = 0; i < o.dims.nbDims; i++) printf("%d%s", o.dims.d[i], (i + 1 < o.dims.nbDims ? "," : ""));
+				printf("]\n");
+			}
+
+			model_loaded = true;
+			model_initialized = true;
+
+			/*
+			const auto& out0 = outs.at(0);
+
+			// out0.host is bytes; convert to float pointer
+			const float* pred = reinterpret_cast<const float*>(out0.host.data());
+
+			// dims: [1,8,8400]
+			int C = out0.dims.d[1];   // 8
+			int N = out0.dims.d[2];   // 8400
+			int numClasses = C - 4;   // 4
+
+			float confThresh = 0.25f;
+			float iouThresh = 0.45f;
+
+			std::vector<RectInfo> dets = decodeYoloV8_1xCxN(
+				pred, C, N, numClasses, confThresh,
+				lb, frame.cols, frame.rows
+			);
+
+			std::vector<RectInfo> finalDets = nms(dets, iouThresh);
+
+			// Draw
+			for (const auto& d : finalDets) {
+				cv::rectangle(frame, d.box, cv::Scalar(0, 255, 0), 2);
+				char txt[64];
+				sprintf_s(txt, "cls=%d %.2f", d.class_id, d.score);
+				cv::putText(frame, txt, cv::Point((int)d.box.x, (int)d.box.y - 5),
+					cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+			}
+			cv::imshow("test", frame);
+			cv::waitKey(0);
+			*/
+		}
+		catch (const std::exception& e) {
+			printf("EXCEPTION: %s\n", e.what());
+			return 1;
+		}
+		catch (...) {
+			printf("UNKNOWN EXCEPTION\n");
+			return 1;
+		}
+	}
+
+	//YOLOv11
+	/*
+	bool useGPU = true;
+	
 	std::string modelPath = app_path + "/" + onnx_model_path;
 	std::string labelsPath = app_path + "/INI/classes.txt";
 
@@ -8383,13 +9899,13 @@ int main(int argc, char* argv[])
 
 	// Perform detection with the updated thresholds
 	std::vector<Detection> detections = yolo_detector.detect(frame, confThreshold, iouThreshold);
+	*/
+	//auto end_time = std::chrono::high_resolution_clock::now();
+	//auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
-	auto end_time = std::chrono::high_resolution_clock::now();
-	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+	//logMessage("Detection completed in " + std::to_string(duration) + "ms");
 
-	logMessage("Detection completed in " + std::to_string(duration) + "ms");
-
-	model_initialized = (detections.size() > 0) ? true : false;
+	//model_initialized = (detections.size() > 0) ? true : false;
 
 	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
 	{
@@ -8411,7 +9927,7 @@ int main(int argc, char* argv[])
 		DEBUG_PLY_PATH = DEBUG_SAMPLE_JOB + "/Depth";
 
 		DEBUG_IMG_FILES = getAllFiles(DEBUG_IMG_PATH, ".jpg");
-		DEBUG_PLY_FILES = getAllFiles(DEBUG_PLY_PATH, ".ply");
+		DEBUG_PLY_FILES = getAllFiles(DEBUG_PLY_PATH, ".pcd");
 
 		DEBUG_MAX_INDEX = (DEBUG_IMG_FILES.size() < DEBUG_PLY_FILES.size()) ? DEBUG_IMG_FILES.size() : DEBUG_PLY_FILES.size();
 		DEBUG_CURRENT_INDEX = 0;
@@ -8420,7 +9936,7 @@ int main(int argc, char* argv[])
 		demo_img = cv::imread("20250302_041440_568_TMini_Image.jpg", cv::IMREAD_COLOR);
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud = std::make_shared<pcl::PointCloud <pcl::PointXYZ>>();
-		if (pcl::io::loadPLYFile<pcl::PointXYZ>("20250302_041440_568_TMini_Depth.ply", *pointCloud) == -1)
+		if (pcl::io::loadPLYFile<pcl::PointXYZ>("20250302_041440_568_TMini_Depth.pcd", *pointCloud) == -1)
 		{
 			std::cout << std::string("Couldn't read file by PLY ") << std::endl;
 			//return false;

@@ -27,21 +27,55 @@ if(WIN32)
 endif()
 
 ### BUILD ###
-add_subdirectory(sick_visionary_cpp_shared)
+set(SICK_VISIONARY_CPP_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/sick_visionary_cpp_shared")
+if(EXISTS "${SICK_VISIONARY_CPP_SHARED_DIR}/CMakeLists.txt")
+  add_subdirectory(sick_visionary_cpp_shared)
+else()
+  message(FATAL_ERROR
+    "Missing 'sick_visionary_cpp_shared' directory.\n"
+    "Extract 'sick_visionary_cpp_shared.7z' into:\n"
+    "  ${SICK_VISIONARY_CPP_SHARED_DIR}\n"
+    "so it contains a CMakeLists.txt."
+  )
+endif()
 
 ## Visionary-S sample ##
-add_executable(SampleVisionaryS SampleVisionaryS/SampleVisionaryS.cpp)
-target_link_libraries(SampleVisionaryS sick_visionary_cpp_shared)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SampleVisionaryS/SampleVisionaryS.cpp")
+  add_executable(SampleVisionaryS SampleVisionaryS/SampleVisionaryS.cpp)
+  target_link_libraries(SampleVisionaryS sick_visionary_cpp_shared)
+else()
+  message(STATUS "Skipping SampleVisionaryS (sources not present).")
+endif()
+
+## Auto-IP scan sample ##
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SampleAutoIP/SampleAutoIPScan.cpp")
+  add_executable(SampleAutoIPScan SampleAutoIP/SampleAutoIPScan.cpp)
+  target_link_libraries(SampleAutoIPScan sick_visionary_cpp_shared)
+else()
+  message(STATUS "Skipping SampleAutoIPScan (sources not present).")
+endif()
 
 ## Visionary-T sample ##
 add_executable(SampleVisionaryT SampleVisionaryT/SampleVisionaryT.cpp)
 target_link_libraries(SampleVisionaryT sick_visionary_cpp_shared)
 
 ## Visionary-T VGA samples ##
-add_executable(SampleVisionaryTVGA SampleVisionaryTVGA/SampleVisionaryTVGA.cpp)
-target_link_libraries(SampleVisionaryTVGA sick_visionary_cpp_shared)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/SampleVisionaryTVGA/SampleVisionaryTVGA.cpp")
+  add_executable(SampleVisionaryTVGA SampleVisionaryTVGA/SampleVisionaryTVGA.cpp)
+  target_link_libraries(SampleVisionaryTVGA sick_visionary_cpp_shared)
+else()
+  message(STATUS "Skipping SampleVisionaryTVGA (sources not present).")
+endif()
 
 ## Visionary-T Mini samples ##
-add_executable(SampleVisionaryTMini SampleVisionaryTMini/SampleVisionaryTMini.cpp)
+add_executable(SampleVisionaryTMini 
+  SampleVisionaryTMini/SampleVisionaryTMini.cpp
+  SampleVisionaryTMini/TrtRunner.cpp
+  SampleVisionaryTMini/TrtRunner.h
+  SampleVisionaryTMini/VA.cpp
+  SampleVisionaryTMini/VA.h
+  SampleVisionaryTMini/CPS.cpp
+  SampleVisionaryTMini/CPS.h
+)
 target_link_libraries(SampleVisionaryTMini sick_visionary_cpp_shared)
 
