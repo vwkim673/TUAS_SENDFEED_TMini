@@ -68,14 +68,13 @@ else()
 endif()
 
 ## Visionary-T Mini samples ##
-add_executable(SampleVisionaryTMini 
+add_executable(SampleVisionaryTMini
   SampleVisionaryTMini/SampleVisionaryTMini.cpp
   SampleVisionaryTMini/TrtRunner.cpp
   SampleVisionaryTMini/TrtRunner.h
   SampleVisionaryTMini/VA.cpp
   SampleVisionaryTMini/VA.h
-  SampleVisionaryTMini/CPS.cpp
-  SampleVisionaryTMini/CPS.h
+  SampleVisionaryTMini/ChassisRoi.h
 )
 target_link_libraries(SampleVisionaryTMini sick_visionary_cpp_shared)
 

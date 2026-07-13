@@ -23,6 +23,7 @@ South Endfeed TMini Processing Application.
 #undef min
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <memory>
@@ -37,6 +38,7 @@ South Endfeed TMini Processing Application.
 #include <direct.h>
 #include <vector>
 #include <numeric>
+#include <cmath>
 #include <condition_variable>
 #include <atomic>
 #include <signal.h>
@@ -134,6 +136,7 @@ South Endfeed TMini Processing Application.
 
 #include "TrtRunner.h"
 #include "YOLO11.hpp"
+#include "ChassisRoi.h"
 
 #pragma comment(lib, "Dbghelp.lib")
 #include <DbgHelp.h>
@@ -153,7 +156,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.2";
+const std::string program_version = "1.3";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -255,6 +258,60 @@ private:
 	bool set_;
 };
 
+//Robust per-axis position latch for the 3D deviation OUTPUT multiplex (mount cone /
+//offload hole & cone). Collects up to N=10 valid samples, then MAD-filters outliers
+//(drop |x-median| > 3*1.4826*MAD) and freezes the median of the survivors. Once
+//locked() the value() never changes until reset(). Invalid (-10000) samples ignored.
+class MedianLatch3D {
+public:
+	void push(const pcl::PointXYZ& p) {
+		if (locked_) return;
+		//Reject the -10000 sentinel AND non-finite (NaN/inf): point-cloud centroids can be
+		//NaN when a region hits invalid depth. A NaN passes "!= -10000" and, once 10 samples
+		//collect, makes std::sort in finalize() violate strict-weak-ordering -> the debug STL
+		//aborts ("Fatal program exit requested"). Guard here so only clean samples enter.
+		if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return;
+		if (p.x == -10000 || p.y == -10000 || p.z == -10000) return;
+		xs_.push_back(p.x); ys_.push_back(p.y); zs_.push_back(p.z);
+		if (xs_.size() >= N_) finalize();
+	}
+	bool locked() const { return locked_; }
+	pcl::PointXYZ value() const { return val_; }
+	void reset() {
+		xs_.clear(); ys_.clear(); zs_.clear();
+		locked_ = false;
+		val_ = pcl::PointXYZ(-10000, -10000, -10000);
+	}
+private:
+	static float median_(std::vector<float> a) {
+		if (a.empty()) return 0.0f;
+		std::sort(a.begin(), a.end());
+		size_t n = a.size();
+		return (n % 2) ? a[n / 2] : 0.5f * (a[n / 2 - 1] + a[n / 2]);
+	}
+	static float madMedian_(const std::vector<float>& v) {
+		float m = median_(v);
+		std::vector<float> dev; dev.reserve(v.size());
+		for (float x : v) dev.push_back(std::abs(x - m));
+		float mad = median_(dev);
+		if (mad <= 1e-6f) return m;					//no spread -> plain median
+		float thr = 3.0f * 1.4826f * mad;			//1.4826 = normal-consistency scale
+		std::vector<float> keep;
+		for (float x : v) if (std::abs(x - m) <= thr) keep.push_back(x);
+		return keep.empty() ? m : median_(keep);
+	}
+	void finalize() {
+		val_.x = madMedian_(xs_);
+		val_.y = madMedian_(ys_);
+		val_.z = madMedian_(zs_);
+		locked_ = true;
+	}
+	static const size_t N_ = 10;
+	std::vector<float> xs_, ys_, zs_;
+	bool locked_ = false;
+	pcl::PointXYZ val_{ -10000, -10000, -10000 };
+};
+
 struct IDEAL_POS
 {
 	bbx CONE;
@@ -327,6 +384,15 @@ struct PRESET_POS
 	MAX_MIN_RANGE R_CST_4XF_RNG;
 	MAX_MIN_RANGE R_CST_4XR_RNG;
 	MAX_MIN_RANGE R_CST_20F_RNG;
+
+	//Per-config CONE HEIGHT (world Y, mm) for FORCE_ROI_MODE region extraction. The
+	//CHS20 wheel is nearer-Z than the cone, so the cone height must be a PRESET (a
+	//runtime nearest-Z estimate would lock onto the wheel). Optional 3rd value of each
+	//PRESET_*_3D range key (MAX;MIN;CONE_Y); defaults below are GT body-centre means.
+	int F_XT_4XF_CY = -218; int F_XT_4XR_CY = -148; int F_XT_20F_CY = -274; int F_XT_20R_CY = -274;
+	int R_XT_4XF_CY = -438; int R_XT_4XR_CY = -323; int R_XT_20F_CY = -435;
+	//4XR values re-derived 2026-07 from the new Center-CHS45-SPRD40 GT samples
+	//(FS cluster H mean -148, RS cluster H mean -323; opposite-cone outlier job excluded).
 };
 
 struct JobInfo
@@ -439,6 +505,12 @@ std::string DEBUG_SENSOR_POSITION = "FRONT";
 bool DEBUG_BATCH_JOB = false;
 std::string DEBUG_BATCH_ROOT_DIR = "";
 std::string DEBUG_BATCH_SAVE_DIR = "";
+//Reverse-replay: process Mount jobs BACKWARDS and treat them as OFFLOAD jobs.
+//A mount recording played in reverse is an offload (landed -> hoist -> separation ->
+//cone-only) -- the only sequence data containing the separation phase, since real
+//offload recordings all end while still landed. Used to exercise/validate the
+//CLPS / CLPS-OK logic offline. seoho.ini [DEBUG] ENABLE_MOUNT_REVERSE=1.
+bool ENABLE_MOUNT_REVERSE = false;
 
 bool DEBUG_CONVERT_PCL_RANGE = false;
 
@@ -465,6 +537,33 @@ int HEIGHT_RANGE_MAX = 200;
 int HEIGHT_RANGE_MIN = -400;
 int TROLLEY_RANGE_MAX = 2000;
 int TROLLEY_RANGE_MIN = 1500;
+
+//FORCE_ROI_MODE: VA-independent chassis localization backup (test path).
+//When set, the chassis 3D body comes from the ROI tracker (ChassisRoi.h)
+//instead of the VA-box mapping; VA still runs for A/B comparison logging.
+bool FORCE_ROI_MODE = false;
+//ROI_FALLBACK: VA-PRIMARY, ROI-FALLBACK (distinct from FORCE_ROI_MODE's always-ROI).
+//VA runs normally; the ROI cone (ChassisRoi.h) replaces _cone_pos ONLY when VA missed
+//the cone or (mount) mis-picked it (VA cone world-X outside the job's preset window).
+bool ROI_FALLBACK = false;
+int ROI_LOCK_K = 3;			//consecutive agreeing frames to lock baseline
+int ROI_LOCK_TOL = 30;		//acquire agreement tolerance (mm)
+int ROI_MOVE_TOL = 50;		//lateral move vs baseline => chassis moved (mm)
+int ROI_REVERIFY_N = 10;	//broad re-verification every N frames
+int ROI_CONE_MIN_H = 50;	//cone/guide summit above deck, min (mm)
+int ROI_CONE_MAX_H = 250;	//cone/guide summit above deck, max (mm)
+int ROI_MIN_POINTS = 50;	//min points to accept the cone/guide body
+//Wide ROI CROP for the close-range XT Center 40chs/20job (F-app, 20F preset). The two
+//front/back cones (split along crop p.x = Gantry) sit close, and the Center sensor is
+//near, so the tight target-centred crop drops the target on a small chassis shift and
+//admits the neighbour. When set (MAX;MIN along p.x), fillRoiParams uses this wider crop so
+//BOTH cones are captured -> coneColumns splits them -> the fixed side-rule picks the target
+//end. Unset (-10000) = use presetRangeX. The VA-validation window stays presetRangeX(tight),
+//so widening the crop does NOT weaken the mis-pick check for this config.
+int ROI_WIDE_20F_MAX = -10000;
+int ROI_WIDE_20F_MIN = -10000;
+ChassisRoiTracker chassisRoiTracker;
+ClpsOffload3D clpsOffload3D;	//3D CLPS / CLPS-OK (offload), reverse-replay validated
 
 PRESET_POS presetPos;
 
@@ -577,7 +676,7 @@ std::string job_result_log_file_name;
 std::chrono::system_clock::time_point sensor_last_attempted_time = std::chrono::system_clock::now();
 std::chrono::system_clock::time_point sensor_last_connected_time = std::chrono::system_clock::now();
 
-//YOLO11Detector yolo_detector;
+YOLO11Detector yolo_detector;
 TrtRunner trt_detector;
 
 bbx LDO_intrim;
@@ -642,6 +741,27 @@ DetectionAverager AVG_CONE;
 DetectionAverager AVG_HOLE;
 
 PCAAverager AVG_CONE_PCA;
+
+//3D deviation OUTPUT multiplex (XT/IGH). The value written to Dev_*_3D (PLC bytes
+//36-41) is phase-multiplexed: POSITION phase -> the robust latched reference; DEVIATION
+//phase -> hole(realtime) - reference(latched). Mount ref = cone(XT)/guide(IGH) latched
+//from job start; offload latches the hole from the start and starts the cone latch at
+//the VA cone-idx1+hole separation. Detection (landout/CLPS) still runs on the realtime
+//deviation; this only shapes the output bytes. Reset per job in reset_jobVariables().
+MedianLatch3D DEV3D_RefLatch;			//chassis reference (cone/guide)
+MedianLatch3D DEV3D_HoleLatch;			//offload phase-1 hole
+int  DEV3D_mount_hole_count = 0;		//cumulative (not continuous) VA hole frames
+bool DEV3D_mount_dev_phase = false;		//sticky: cone position -> deviation
+bool DEV3D_offload_dev_phase = false;	//sticky: hole position -> deviation
+
+//Validated VA cone INIT (mount, ROI_FALLBACK). Once the VA cone is seen IN-RANGE (inside
+//the job's preset window) we latch it: 3D position (robust median) + last-good 2D box.
+//On a later VA failure we reuse this (chassis stationary until load transfer) BEFORE
+//resorting to ROI. An out-of-range mis-pick never enters the latch, so systematically
+//mis-picked jobs correctly fall through to ROI. Reset per job.
+MedianLatch3D VA_ConeInit3D;			//validated init cone WORLD position
+bbx  VA_ConeInit2D;						//validated init cone 2D box (last in-range)
+bool VA_ConeInit2D_Set = false;
 
 bbx Offload_Hole_Base;
 bbx Offload_Hole_intrim;
@@ -1275,6 +1395,11 @@ auto parseINI(string path) -> bool
 		DEBUG_BATCH_ROOT_DIR = inidata.get("DEBUG").get("DEBUG_BATCH_ROOT_DIR");
 		DEBUG_BATCH_SAVE_DIR = inidata.get("DEBUG").get("DEBUG_BATCH_SAVE_DIR");
 
+		//Optional: reverse-replay Mount jobs as OFFLOAD (CLPS/CLPS-OK offline testing).
+		if (inidata.get("DEBUG").has("ENABLE_MOUNT_REVERSE"))
+			ENABLE_MOUNT_REVERSE = inidata.get("DEBUG").get("ENABLE_MOUNT_REVERSE") == "1";
+		if (ENABLE_MOUNT_REVERSE) logMessage("[DEBUG] ENABLE_MOUNT_REVERSE: Mount jobs will be replayed BACKWARDS as OFFLOAD");
+
 		if (MODE_DEBUG || DEBUG_WITH_FILES || DEBUG_BATCH_JOB) logMessage("Debug Sensor Pos: " + DEBUG_SENSOR_POSITION);
 
 		logMessage("INI Configuration Complete!");
@@ -1293,6 +1418,17 @@ void parseProcessINI(string path)
 
 	if (file.read(ini))
 	{
+		//Optional per-config CONE_Y = 3rd field of the XT_* range keys (MAX;MIN;CONE_Y).
+		//MUST be throw-safe: legacy INIs carry a free-text comment as the 3rd field, and
+		//parseProcessINI runs inside one big try -- an uncaught stoi would silently abort
+		//ALL remaining preset parsing.
+		auto parseCY = [](const std::vector<std::string>& parts, int& dst)
+		{
+			if ((int)parts.size() <= 2) return;
+			try { dst = std::stoi(parts.at(2)); }
+			catch (...) {}	//non-numeric 3rd field (comment) -> keep default
+		};
+
 		try
 		{
 
@@ -1312,6 +1448,24 @@ void parseProcessINI(string path)
 			TROLLEY_MMR.MAX = TROLLEY_RANGE_MAX;
 			TROLLEY_MMR.MIN = TROLLEY_RANGE_MIN;
 
+			//FORCE_ROI_MODE keys are optional; defaults apply when absent.
+			if (ini.get("SETTINGS").has("FORCE_ROI_MODE")) FORCE_ROI_MODE = (std::stoi(ini.get("SETTINGS").get("FORCE_ROI_MODE")) != 0);
+			if (ini.get("SETTINGS").has("ROI_FALLBACK")) ROI_FALLBACK = (std::stoi(ini.get("SETTINGS").get("ROI_FALLBACK")) != 0);
+			if (ini.get("SETTINGS").has("ROI_WIDE_20F_MAX")) ROI_WIDE_20F_MAX = std::stoi(ini.get("SETTINGS").get("ROI_WIDE_20F_MAX"));
+			if (ini.get("SETTINGS").has("ROI_WIDE_20F_MIN")) ROI_WIDE_20F_MIN = std::stoi(ini.get("SETTINGS").get("ROI_WIDE_20F_MIN"));
+			if (ini.get("SETTINGS").has("ROI_LOCK_K")) ROI_LOCK_K = std::stoi(ini.get("SETTINGS").get("ROI_LOCK_K"));
+			if (ini.get("SETTINGS").has("ROI_LOCK_TOL")) ROI_LOCK_TOL = std::stoi(ini.get("SETTINGS").get("ROI_LOCK_TOL"));
+			if (ini.get("SETTINGS").has("ROI_MOVE_TOL")) ROI_MOVE_TOL = std::stoi(ini.get("SETTINGS").get("ROI_MOVE_TOL"));
+			if (ini.get("SETTINGS").has("ROI_REVERIFY_N")) ROI_REVERIFY_N = std::stoi(ini.get("SETTINGS").get("ROI_REVERIFY_N"));
+			if (ini.get("SETTINGS").has("ROI_CONE_MIN_H")) ROI_CONE_MIN_H = std::stoi(ini.get("SETTINGS").get("ROI_CONE_MIN_H"));
+			if (ini.get("SETTINGS").has("ROI_CONE_MAX_H")) ROI_CONE_MAX_H = std::stoi(ini.get("SETTINGS").get("ROI_CONE_MAX_H"));
+			if (ini.get("SETTINGS").has("ROI_MIN_POINTS")) ROI_MIN_POINTS = std::stoi(ini.get("SETTINGS").get("ROI_MIN_POINTS"));
+			logMessage("[INI] FORCE_ROI_MODE: " + std::to_string(FORCE_ROI_MODE)
+				+ " (LOCK_K:" + std::to_string(ROI_LOCK_K)
+				+ " LOCK_TOL:" + std::to_string(ROI_LOCK_TOL)
+				+ " MOVE_TOL:" + std::to_string(ROI_MOVE_TOL)
+				+ " REVERIFY_N:" + std::to_string(ROI_REVERIFY_N) + ")");
+
 			//PCA - 3D -- FRONT
 			//XT
 			auto tVal = ini.get("PRESET_FRONT_3D").get("XT_4XF");
@@ -1320,6 +1474,7 @@ void parseProcessINI(string path)
 
 			presetPos.F_XT_4XF_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.F_XT_4XF_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.F_XT_4XF_CY);
 
 			tVal = ini.get("PRESET_FRONT_3D").get("XT_4XR");
 			remove_all_whitespace(tVal);
@@ -1327,6 +1482,7 @@ void parseProcessINI(string path)
 
 			presetPos.F_XT_4XR_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.F_XT_4XR_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.F_XT_4XR_CY);
 
 			tVal = ini.get("PRESET_FRONT_3D").get("XT_20F");
 			remove_all_whitespace(tVal);
@@ -1334,6 +1490,7 @@ void parseProcessINI(string path)
 
 			presetPos.F_XT_20F_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.F_XT_20F_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.F_XT_20F_CY);
 
 			tVal = ini.get("PRESET_FRONT_3D").get("XT_20R");
 			remove_all_whitespace(tVal);
@@ -1341,6 +1498,7 @@ void parseProcessINI(string path)
 
 			presetPos.F_XT_20R_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.F_XT_20R_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.F_XT_20R_CY);
 
 			//IGH
 			tVal = ini.get("PRESET_FRONT_3D").get("IGH_4XF");
@@ -1408,6 +1566,7 @@ void parseProcessINI(string path)
 
 			presetPos.R_XT_4XF_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.R_XT_4XF_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.R_XT_4XF_CY);
 
 			tVal = ini.get("PRESET_REAR_3D").get("XT_4XR");
 			remove_all_whitespace(tVal);
@@ -1415,6 +1574,7 @@ void parseProcessINI(string path)
 
 			presetPos.R_XT_4XR_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.R_XT_4XR_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.R_XT_4XR_CY);
 
 			tVal = ini.get("PRESET_REAR_3D").get("XT_20F");
 			remove_all_whitespace(tVal);
@@ -1422,6 +1582,7 @@ void parseProcessINI(string path)
 
 			presetPos.R_XT_20F_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.R_XT_20F_RNG.MIN = std::stoi(tParts.at(1));
+			parseCY(tParts, presetPos.R_XT_20F_CY);
 
 			//IGH
 			tVal = ini.get("PRESET_REAR_3D").get("IGH_4XF");
@@ -1780,6 +1941,20 @@ void reset_jobVariables()
 	current_job_info = JobInfo();
 	current_process_results = ProcessResults();
 
+	chassisRoiTracker.reset();
+	clpsOffload3D.reset();
+
+	//3D deviation output multiplex state
+	DEV3D_RefLatch.reset();
+	DEV3D_HoleLatch.reset();
+	DEV3D_mount_hole_count = 0;
+	DEV3D_mount_dev_phase = false;
+	DEV3D_offload_dev_phase = false;
+
+	VA_ConeInit3D.reset();
+	VA_ConeInit2D = bbx();
+	VA_ConeInit2D_Set = false;
+
 	//VA
 	Detected_XT = false; Detected_CST = false; Detected_IGH = false;
 	Detected_Cntr = false; Detected_Chs = false;
@@ -1895,6 +2070,10 @@ std::vector<std::string> getAllFiles(boost::filesystem::path const& root, std::s
 			}
 		}
 	}
+	//Filenames start with the timestamp, so lexicographic = chronological. The directory
+	//iterator's order is filesystem-dependent -- an explicit sort makes the frame order
+	//(and ENABLE_MOUNT_REVERSE's reversal) deterministic.
+	std::sort(full_paths.begin(), full_paths.end());
 	return full_paths;
 }
 
@@ -2045,9 +2224,12 @@ auto makeCommand(char* sendbuf) -> void {
 		sendbuf[16] = static_cast<char>(op_byte_16.to_ulong());
 
 		std::bitset<8>op_byte_17(0);
-		if (current_process_results.VA_isLandout) op_byte_17.set(0);
-		if (current_process_results.VA_isCLPS) op_byte_17.set(1);
-		if (current_process_results.PCA_isCLPS_OK) op_byte_17.set(2);
+		//2026-07 fix: byte17 is THE combined output byte. It used to mix VA-only bits
+		//(0,1) with a PCA-only bit (2), ignoring the combined b* results entirely --
+		//the documented makeCommand bug. Per-pipeline values remain on byte30 (PCA).
+		if (current_process_results.bLandOutDetected) op_byte_17.set(0);
+		if (current_process_results.bClpsDetected) op_byte_17.set(1);
+		if (current_process_results.bClpsOkDetected) op_byte_17.set(2);
 		sendbuf[17] = static_cast<char>(op_byte_17.to_ulong());
 
 		//Detected_Chs_X_3D
@@ -7007,6 +7189,30 @@ bool target_selections_va(bool isFrontSensor, std::string cam_pos, std::string j
 			if (det_sorted_objects[0].size() > 0)
 			{
 				std::vector<bbx> detected_holes = det_sorted_objects[0];
+
+				//CenterClose (XT 40ft, Center sensor): a 40ft chassis carrying 20ft containers
+				//has TWO positions, so two container holes can appear. Drop holes that are
+				//COUPLED (2D-box overlap) to a LAND(idx2) box -- an already-landed NEIGHBOUR
+				//container -- so the target stays the FREE (descending) container. If ALL holes
+				//are coupled (e.g. the target itself just landed) keep them so landing isn't broken.
+				if (chassisType == "XT" && chassis_size == 40 && cam_pos == "Center" && det_sorted_objects[2].size() > 0)
+				{
+					std::vector<bbx> freeHoles;
+					for (const auto& h : detected_holes)
+					{
+						bool coupled = false;
+						for (const auto& l : det_sorted_objects[2])
+							if (h.x < l.x + l.w && h.x + h.w > l.x && h.y < l.y + l.h && h.y + h.h > l.y) { coupled = true; break; }
+						if (!coupled) freeHoles.push_back(h);
+					}
+					if (!freeHoles.empty() && freeHoles.size() < detected_holes.size())
+					{
+						logMessage("[HoleFilter] dropped " + std::to_string(detected_holes.size() - freeHoles.size()) + " LAND-coupled hole(s), " + std::to_string(freeHoles.size()) + " free");
+						if (jobLog) jobLogMessage("[HoleFilter] dropped LAND-coupled hole(s)");
+						detected_holes = freeHoles;
+					}
+				}
+
 				//ascending order.
 				std::sort(detected_holes.begin(), detected_holes.end(), [](const bbx& a, const bbx& b) {
 					return a.center_x < b.center_x;  // Comparison based on the 'center_x' field
@@ -7717,59 +7923,89 @@ bool clps_detection_va(std::string ChassisType, bbx target_hole, bbx target_cone
 
 			if (ChassisType == "XT")
 			{
-				if (target_hole.prob > 70 && (target_cone.prob > 70 && target_cone.index == 1))
+				//2026-07: instant-fire REMOVED. Reverse-replay proved the ungated single-frame
+				//rule asserts CLPS-OK while LANDED (partner cone seen as idx1: 4 jobs / 98
+				//frames) -- the intolerable FP. Both paths are now gated by landed==OFF and
+				//debounced with CLPS_NCOUNT; landed re-ON releases (re-land observed in data).
+				if (sprd_landed)
 				{
-					auto diff_y = target_cone.center_y - target_hole.center_y;
-					if (diff_y > 20)
+					CLPS_OK_Current_Count = 0;
+					if (clps_ok_detected)
 					{
-						if (!clps_ok_detected)
-						{
-							logMessage("VA CLPS-OK Detected! by Cone and Hole, diff_y: " + std::to_string(diff_y));
-							if (jobLog) jobLogMessage("VA CLPS-OK Detected! by Cone and Hole, diff_y: " + std::to_string(diff_y));
-						}
-						clps_ok_detected = true;
-
+						logMessage("VA CLPS-OK Released! by Landed bit ON");
+						if (jobLog) jobLogMessage("VA CLPS-OK Released! by Landed bit ON");
 					}
+					clps_ok_detected = false;
 				}
-				//2025.08.23
 				else if (target_cone.prob > 70 && target_cone.index == 1)
 				{
-					if (!clps_ok_detected)
+					//2026-07 rework: the target HOLE is now REQUIRED. VA CLPS-OK asserts ONLY
+					//on the certain two-object separation -- the unloaded chassis cone (idx1)
+					//AND the container hole BOTH detected, with the hole above the cone
+					//(cone.center_y - hole.center_y > 20px). The cone-only default-true was
+					//removed: it asserted on the idx1 partner-cone flap while landed (the
+					//intolerable FP). The cone-only END state (hole gone once the container
+					//leaves frame) is intentionally NOT asserted here -- the 3D ClpsOffload3D
+					//height machine covers it, so the combined output still fires there.
+					bool sep = (target_hole.prob > 70)
+						&& ((target_cone.center_y - target_hole.center_y) > 20);
+					if (sep)
 					{
-						logMessage("VA CLPS-OK Detected! by Cone, no Hole, prob: " + std::to_string(target_cone.prob));
-						if (jobLog) jobLogMessage("VA CLPS-OK Detected! by Cone, no Hole, prob: " + std::to_string(target_cone.prob));
-					}
-					clps_ok_detected = true;
-				}
-				else if (clps_ok_detected)
-				{
-					if (target_cone.prob > 70 && target_cone.index == 2)
-					{
-						if (clps_ok_detected)
+						if (CLPS_OK_Current_Count < CLPS_NCOUNT) CLPS_OK_Current_Count++;
+						if (CLPS_OK_Current_Count >= CLPS_NCOUNT)
 						{
-							logMessage("VA CLPS-OK Released! by Landed");
-							if (jobLog) jobLogMessage("VA CLPS-OK Released! by Landed");
+							if (!clps_ok_detected)
+							{
+								logMessage("VA CLPS-OK Detected! (cone idx1 + hole, Y-sep) dy: " + std::to_string(target_cone.center_y - target_hole.center_y));
+								if (jobLog) jobLogMessage("VA CLPS-OK Detected! (cone idx1 + hole, Y-sep) dy: " + std::to_string(target_cone.center_y - target_hole.center_y));
+							}
+							clps_ok_detected = true;
 						}
-						clps_ok_detected = false;
 					}
-
+					else if (CLPS_OK_Current_Count > 0) CLPS_OK_Current_Count--;
+				}
+				else if (target_cone.prob > 70 && target_cone.index == 2)
+				{
+					CLPS_OK_Current_Count = 0;
+					if (clps_ok_detected)
+					{
+						logMessage("VA CLPS-OK Released! by Landed class");
+						if (jobLog) jobLogMessage("VA CLPS-OK Released! by Landed class");
+					}
+					clps_ok_detected = false;
 				}
 			}
 
 			else if (ChassisType == "IGH")
 			{
-				if (target_hole.prob > 70 && target_cone.prob > 70)
+				//2026-07: same gate + debounce as XT (was instant, no release).
+				if (sprd_landed)
+				{
+					CLPS_OK_Current_Count = 0;
+					if (clps_ok_detected)
+					{
+						logMessage("VA CLPS-OK Released! by Landed bit ON");
+						if (jobLog) jobLogMessage("VA CLPS-OK Released! by Landed bit ON");
+					}
+					clps_ok_detected = false;
+				}
+				else if (target_hole.prob > 70 && target_cone.prob > 70)
 				{
 					auto diff_y = target_cone.center_y - target_hole.center_y;
 					if (diff_y > 20)
 					{
-						if (!clps_ok_detected)
+						if (CLPS_OK_Current_Count < CLPS_NCOUNT) CLPS_OK_Current_Count++;
+						if (CLPS_OK_Current_Count >= CLPS_NCOUNT)
 						{
-							logMessage("VA CLPS-OK Detected! by Cone and Hole, diff_y: " + std::to_string(diff_y));
-							if (jobLog) jobLogMessage("VA CLPS-OK Detected! by Cone and Hole, diff_y: " + std::to_string(diff_y));
+							if (!clps_ok_detected)
+							{
+								logMessage("VA CLPS-OK Detected! (gated+debounced) by Cone and Hole, diff_y: " + std::to_string(diff_y));
+								if (jobLog) jobLogMessage("VA CLPS-OK Detected! (gated+debounced) by Cone and Hole, diff_y: " + std::to_string(diff_y));
+							}
+							clps_ok_detected = true;
 						}
-						clps_ok_detected = true;
 					}
+					else if (CLPS_OK_Current_Count > 0) CLPS_OK_Current_Count--;
 				}
 			}
 
@@ -8728,7 +8964,105 @@ bool deviation_output_pca(bool isFrontSensor, bool Target_on_Right, bool isMount
 	}
 }
 
+//Cone/guide side selection for the ROI backup path (site rule, 2026-06).
+//Left/right runs along the GANTRY axis: G goes -(left) to +(right) in the
+//camera view. FS/CS: -G is toward the chassis front; RS: +G is toward the
+//chassis front (sensor on the other side of the lane).
+// - Front sensor: 45ft chassis with 40ft container job -> right cone;
+//   any other job -> left (or only) cone.
+// - Center sensor: Big job -> left cone; Small job -> right cone.
+// - Rear sensor: not specified yet; defaults to left.
+bool roi_cone_on_right(std::string cam_pos, JobInfo jobInfo)
+{
+	if (cam_pos == "Center") return (jobInfo.jobPos == "Small");
+	if (cam_pos == "Front") return (jobInfo.chassisLen == 45 && jobInfo.jobSize == 40);
+	return false;
+}
+
 //2025.11.26 Endfeed용으로 수정.
+//Build the per-job ROI params (preset world window + per-config XT cone height).
+//Shared by FORCE_ROI_MODE and the ROI_FALLBACK path so the cone-height table lives once.
+void fillRoiParams(const JobInfo& jobInfo, ChassisRoiParams& roiPrm)
+{
+	roiPrm.xMin = (float)jobInfo.presetRangeX.MIN;
+	roiPrm.xMax = (float)jobInfo.presetRangeX.MAX;
+	roiPrm.yMin = (float)HEIGHT_MMR.MIN;
+	roiPrm.yMax = (float)HEIGHT_MMR.MAX;
+	roiPrm.zMin = (float)TROLLEY_MMR.MIN;
+	roiPrm.zMax = (float)TROLLEY_MMR.MAX;
+	roiPrm.lockK = ROI_LOCK_K;
+	roiPrm.lockTol = (float)ROI_LOCK_TOL;
+	roiPrm.moveTol = (float)ROI_MOVE_TOL;
+
+	//Per-config cone HEIGHT (world Y) -- the CHS20 wheel is nearer-Z than the cone, so a
+	//runtime estimate would pick the wheel. XT only; IGH/CST leave coneY unset (-10000).
+	if (jobInfo.chassisType == "XT")
+	{
+		if (CURRENT_SENSOR_POSITION == "FRONT")
+		{
+			if (jobInfo.chassisLen == 45 && jobInfo.jobSize == 40)         roiPrm.coneY = (float)presetPos.F_XT_4XR_CY;
+			else if (jobInfo.chassisLen == 45 && jobInfo.jobPos == "Small") roiPrm.coneY = (float)presetPos.F_XT_20R_CY;
+			else if (jobInfo.chassisLen == 40 && jobInfo.jobPos == "Small") roiPrm.coneY = (float)presetPos.F_XT_20F_CY;
+			else                                                           roiPrm.coneY = (float)presetPos.F_XT_4XF_CY;
+		}
+		else
+		{
+			if (jobInfo.jobPos == "Big")       roiPrm.coneY = (float)presetPos.R_XT_20F_CY;
+			else if (jobInfo.chassisLen == 40) roiPrm.coneY = (float)presetPos.R_XT_4XF_CY;
+			else                               roiPrm.coneY = (float)presetPos.R_XT_4XR_CY;
+		}
+	}
+
+	//WIDE CROP override -- close-range XT Center 40chs/20job (F app -> Center sensor, 20F).
+	//Widen ONLY the crop p.x window (the Gantry / front-back axis the two cones split along)
+	//so both cones are always captured; coneColumns + the fixed side-rule then pick the
+	//target end. presetRangeX (used for VA mis-pick validation) is left untouched.
+	if (jobInfo.chassisType == "XT" && CURRENT_SENSOR_POSITION == "FRONT"
+		&& jobInfo.chassisLen == 40 && jobInfo.jobPos == "Small"
+		&& ROI_WIDE_20F_MAX != -10000 && ROI_WIDE_20F_MIN != -10000)
+	{
+		roiPrm.xMin = (float)ROI_WIDE_20F_MIN;
+		roiPrm.xMax = (float)ROI_WIDE_20F_MAX;
+	}
+}
+
+//Localize the chassis cone from the preset ROI (VA-independent), returning a WORLD point
+//(-10000 sentinel on failure). Self-contained: does NOT touch the VA _pcCone/_cone_pos.
+//XT uses the near-Z-face refinement (same chain as FORCE_ROI); IGH uses pc_IGH_detection.
+pcl::PointXYZ computeRoiConePos(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool target_on_right,
+	const JobInfo& jobInfo, const std::string& savePath)
+{
+	pcl::PointXYZ result(-10000.f, -10000.f, -10000.f);
+	try
+	{
+		ChassisRoiParams prm; fillRoiParams(jobInfo, prm);
+		pcl::PointXYZ coarse(-10000.f, -10000.f, -10000.f);
+		auto crop = chassis_roi_crop(pointCloud, prm.xMin, prm.xMax, prm.yMin, prm.yMax, prm.zMin, prm.zMax, savePath, "ROI_FB");
+		auto region = chassis_roi_extract_region(crop, target_on_right, prm, coarse, savePath, "ROI_FB");
+		if (!region || region->points.size() == 0) return result;
+
+		if (jobInfo.chassisType == "IGH")
+		{
+			result = pc_IGH_detection_naive(region, target_on_right, "");
+		}
+		else //XT
+		{
+			auto clean = chassis_roi_sor(region);
+			auto face = chassis_roi_near_face(clean, 80.f);
+			pcl::PointXYZ nc = pc_cone_detection_naive(face, target_on_right, "");
+			if (nc.x != -10000.f)
+			{
+				chassis_roi_sparse_edge_rescue(face, target_on_right, nc);
+				float ch = chassis_roi_corner_height(face, nc.x, nc.z);
+				if (ch != -10000.f) nc.y = ch;
+				result = nc;
+			}
+		}
+	}
+	catch (...) {}
+	return result;
+}
+
 ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat image, pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, std::string savePath, bool jobLog, bool debugMode, std::string& logLines)
 {
 	ProcessResults procResults;
@@ -8750,8 +9084,8 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	int det_count = 0;
 	std::vector<rectangle_info> det_results;
 	std::vector<std::vector<bbx>> det_sorted_objects(class_names.size(), std::vector<bbx>(0));
-	auto inference_status = trt_inference(trt_detector, image, ref(res_image), ref(det_results), ref(det_sorted_objects), ref(det_count), savePath);
-	
+	//auto inference_status = trt_inference(trt_detector, image, ref(res_image), ref(det_results), ref(det_sorted_objects), ref(det_count), savePath);
+	auto inference_status = yolo_inference(yolo_detector, image, ref(res_image), ref(det_results), ref(det_sorted_objects), ref(det_count), savePath);
 	//Intrim variables
 	bool usePreset = false;
 	bool usePreset_CC = false;
@@ -8767,6 +9101,7 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	int _dvOutX_mm = -10000, _dvOutY_mm = -10000;	
 
 	bool _sprd_landed_trigger = false;
+	bool _eff_landed = false;	//PLC landed bit in live, visual trigger in debug/batch
 
 	bool _landout_detected = false;
 	bool _clps_detected = false, _clps_ok_detected = false;
@@ -8839,6 +9174,10 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		pre_land_chassis_position_va(jobInfo.isMountCycle, jobInfo.isOffloadCycle, _target_cone, _target_hole);
 
 		_sprd_landed_trigger = debug_landed_trigger(isFrontSensor, _detected_chassis_type, _target_hole, _target_cone, _target_guide);
+		//Effective landed = the RELIABLE PLC bit in live (aggregates all 4 spreader
+		//corners); the visual trigger only in debug/batch where no PLC is connected.
+		//The PLC bit was parsed but UNUSED before 2026-07 (visual-only gating).
+		_eff_landed = (MODE_DEBUG || DEBUG_BATCH_JOB || DEBUG_WITH_FILES) ? _sprd_landed_trigger : SPRD_Landed;
 
 		deviation_output_va(isFrontSensor, cam_pos, _detected_chassis_type, _target_hole, _target_cone, _target_guide, ref(_cntrX), ref(_cntrY), ref(_cntrProb), ref(_coneX), ref(_coneY), ref(_coneProb), ref(_dvOutX), ref(_dvOutY), ref(_dvOutX_mm), ref(_dvOutY_mm), jobLog);
 
@@ -8850,7 +9189,9 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 #pragma endregion
 
 #pragma region clps detection
-		if (jobInfo.isOffloadCycle) clps_detection_va(_detected_chassis_type, _target_hole, _target_cone, _target_guide, _sprd_landed_trigger, ref(_clps_detected), ref(_clps_ok_detected), jobLog);
+		//_eff_landed (PLC bit in live): gates the VA CLPS-OK paths and drives the CST
+		//rule -- site premise: CST has no locks, PLC landed OFF alone may assert CLPS-OK.
+		if (jobInfo.isOffloadCycle) clps_detection_va(_detected_chassis_type, _target_hole, _target_cone, _target_guide, _eff_landed, ref(_clps_detected), ref(_clps_ok_detected), jobLog);
 #pragma endregion
 
 
@@ -8896,7 +9237,27 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	{
 		usePreset_CC = true;
 	}
-	if (_target_cone.prob == 0)
+
+	//FORCE_ROI_MODE: preset-ROI crop -> existing detector -> tracker + A/B.
+	ChassisRoiParams roiPrm;
+	bool _ab_valid = false;
+	int _ab_dT = -10000, _ab_dH = -10000, _ab_dG = -10000;
+
+#pragma region FORCE_ROI_MODE - setup (test/backup path)
+	bbx _va_chassis_ab;	//VA chassis detection kept aside for A/B comparison.
+	if (FORCE_ROI_MODE)
+	{
+		//Chassis type comes from the job data; VA may be absent entirely here.
+		if (_detected_chassis_type == "" || _detected_chassis_type == "unknown")
+			_detected_chassis_type = jobInfo.chassisType;
+
+		_va_chassis_ab = (_target_guide.prob > _target_cone.prob) ? _target_guide : _target_cone;
+
+		fillRoiParams(jobInfo, roiPrm);
+	}
+#pragma endregion
+
+	if (!FORCE_ROI_MODE && _target_cone.prob == 0)
 	{
 		usePreset = true;
 		_target_cone = jobInfo.presetBox;
@@ -8933,8 +9294,78 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		}
 	}
 
+	//A/B debug: keep VA's own mapped cone target (via the full detector chain)
+	//to compare against the ROI-cropped result. Computed here before the ROI
+	//crop overwrites _target_cone/_pcCone.
+	pcl::PointXYZ _ab_va_cone(-10000.f, -10000.f, -10000.f);
+	if (FORCE_ROI_MODE && _va_chassis_ab.prob >= 70 && jobInfo.chassisType != "CST")
+	{
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pcVa(new pcl::PointCloud<pcl::PointXYZ>);
+		*pcVa = *map_box_to_pc_noisefiltertest(pointCloud, _va_chassis_ab, 0, 0, "");
+		if (savePath != std::string("") && pcVa->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_AB_va_body.pcd", *pcVa);
+		if (pcVa->points.size() > 0)
+		{
+			bbx vaCone = _va_chassis_ab;
+			if (vaCone.index < 1) vaCone.index = (jobInfo.chassisType == "IGH") ? 3 : 1;
+			//Same detector the ROI path uses, on the VA box crop -> apples to apples.
+			if (vaCone.index == 1) _ab_va_cone = pc_cone_detection_naive(pcVa, target_on_right, "");
+			else if (vaCone.index == 3) _ab_va_cone = pc_IGH_detection_naive(pcVa, target_on_right, "");
+			else _ab_va_cone = pc_cone_detection_naive(pcVa, target_on_right, "");
+
+			//Save VA's cone POINT too (for the 3-way GT/ROI/VA visual overlay).
+			if (savePath != std::string("") && _ab_va_cone.x != -10000.f)
+			{
+				pcl::PointCloud<pcl::PointXYZ> vc; vc.points.push_back(_ab_va_cone);
+				vc.width = 1; vc.height = 1; vc.is_dense = true;
+				pcl::io::savePCDFileBinaryCompressed(savePath + "_AB_va_conePos.pcd", vc);
+			}
+		}
+	}
+
 #pragma region Target pointcloud extraction via VA-Based
-	if (usePreset)
+	pcl::PointXYZ _roi_cone_pos(-10000.f, -10000.f, -10000.f);
+	if (FORCE_ROI_MODE)
+	{
+		//Hole stays VA-based (container/cornercasting phase is the next stage).
+		if (_target_hole.prob > 0)
+		{
+			std::string bPath = (savePath != std::string("")) ? savePath + "_Hole" : "";
+			_pcHole = map_box_to_pc_noisefiltertest(pointCloud, _target_hole, 0, 0, bPath);
+			if (savePath != std::string("") && _pcHole->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_pcHole.pcd", *_pcHole);
+		}
+
+		//Crop the preset world ROI (cone-height Y band + lane-bordered trolley),
+		//then EXTRACT the target cone+plate REGION (per-column near-Z candidate ->
+		//side-rule -> tight lateral/depth/height box). This region REPLACES the VA
+		//mapping: it is fed as _pcCone (or _pcGuide for CST) so position_detection_pca
+		//localizes it with the same pc_*_detection chain VA uses.
+		std::string roiTag = chassisRoiTracker.locked() ? "ROI_TRK" : "ROI_ACQ";
+		auto roiCrop = chassis_roi_crop(pointCloud, roiPrm.xMin, roiPrm.xMax, roiPrm.yMin, roiPrm.yMax, roiPrm.zMin, roiPrm.zMax, savePath, roiTag);
+		//ROI region stays FULL (cone+plate; body may be included) -- the targeting logic
+		//below, not the region, is what excludes the back body.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr _roiRegion = chassis_roi_extract_region(roiCrop, target_on_right, roiPrm, _roi_cone_pos, savePath, roiTag);
+		if (jobInfo.chassisType == "CST") _pcGuide = _roiRegion;
+		else                              _pcCone = _roiRegion;
+
+		//Synthetic target class so deviation/logging downstream behave.
+		if (jobInfo.chassisType == "CST")
+		{
+			_target_cone = bbx();
+			_target_guide = bbx();
+			_target_guide.index = 6;
+			_target_guide.label = "csts";
+			_target_guide.prob = 50;
+		}
+		else
+		{
+			_target_guide = bbx();
+			_target_cone = bbx();
+			_target_cone.index = (jobInfo.chassisType == "IGH") ? 3 : 1;
+			_target_cone.label = (jobInfo.chassisType == "IGH") ? "igh" : "cone";
+			_target_cone.prob = 50;
+		}
+	}
+	else if (usePreset)
 	{
 		target_pointcloud_extraction_preset(pointCloud, jobInfo.presetRangeX, HEIGHT_MMR, TROLLEY_MMR, _sprd_landed_trigger, usePreset_CC, _target_hole, ref(_pcHole), ref(_pcCone), ref(_pcGuide), savePath);
 	}
@@ -8948,13 +9379,288 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	position_detection_pca(jobInfo, usePreset, isFrontSensor, target_on_right, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _pcHole, _pcCone, _pcGuide, ref(_hole_pos), ref(_cone_pos), ref(_guide_pos), savePath);
 #pragma endregion
 
+#pragma region ROI FALLBACK + validated VA-init reuse (VA-primary) -- XT/IGH
+	//Priority: current VA cone (in-range) -> validated VA INIT -> ROI (last resort). The
+	//init latch accepts ONLY in-range VA cones, so a systematic mis-pick (45/40 grabbing the
+	//FRONT cone) never poisons it -> such jobs correctly fall to ROI, while a job that
+	//started well but lost VA (occlusion as the container descends) reuses the validated
+	//init. `usePreset` = the earlier 2D-preset fallback fired (VA cone absent). _cone_pos is
+	//the chassis reference for BOTH XT and IGH. Init reuse is MOUNT-only; offload = MISS->ROI.
+	int  _coneSrc = 0;	//0=VA current, 1=VA init(3D pos), 2=VA init(2D box remap), 3=ROI
+	if (ROI_FALLBACK && !FORCE_ROI_MODE
+		&& (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH"))
+	{
+		if (jobInfo.isMountCycle)
+		{
+			bool vaPresent = (!usePreset && _target_cone.prob > 0 && _cone_pos.x != -10000.f);
+			bool vaInRange = vaPresent
+				&& _cone_pos.x >= (float)jobInfo.presetRangeX.MIN
+				&& _cone_pos.x <= (float)jobInfo.presetRangeX.MAX;
+
+			if (vaInRange)
+			{
+				//Trustworthy current VA cone -> use it AND feed the validated init latches.
+				VA_ConeInit2D = _target_cone; VA_ConeInit2D_Set = true;
+				VA_ConeInit3D.push(_cone_pos);
+			}
+			else
+			{
+				bool wasMispick = vaPresent;	//present but out-of-range (a miss => !vaPresent)
+
+				//1) Validated VA init, preferred over ROI.
+				if (VA_ConeInit2D_Set)
+				{
+					if (VA_ConeInit3D.locked())
+					{
+						_cone_pos = VA_ConeInit3D.value();	//occlusion-proof (chassis stationary)
+						_coneSrc = 1;
+					}
+					else
+					{
+						//No robust 3D yet -> re-extract the region from the latched 2D box on
+						//the CURRENT cloud and run the same cone-position logic.
+						auto pcInit = map_box_to_pc_noisefiltertest(pointCloud, VA_ConeInit2D, 0, 0, "");
+						pcl::PointXYZ ip(-10000.f, -10000.f, -10000.f);
+						if (pcInit->points.size() > 0)
+							ip = (_detected_chassis_type == "IGH")
+								? pc_IGH_detection_naive(pcInit, target_on_right, "")
+								: pc_cone_detection_naive(pcInit, target_on_right, "");
+						if (ip.x != -10000.f) { _cone_pos = ip; _coneSrc = 2; }
+					}
+
+					if (_coneSrc != 0)
+					{
+						//Treat as detected: restore the validated VA 2D box (REAL coords, not a
+						//synthetic marker) so bDetected_Chassis + VA reporting reflect it.
+						_target_cone = VA_ConeInit2D;
+						if (wasMispick) { _landout_detected = false; LDO_Current_Count = 0; }
+						logMessage(std::string("[VA_INIT] current VA cone ") + (wasMispick ? "out-of-range" : "missed")
+							+ " -> reuse validated init (" + (_coneSrc == 1 ? "3D pos" : "2D-box remap")
+							+ ") T:" + std::to_string((int)_cone_pos.x));
+						if (jobLog) jobLogMessage("[VA_INIT] reuse validated init cone");
+					}
+				}
+
+				//2) ROI last resort (no validated init, or the 2D re-extract failed).
+				if (_coneSrc == 0)
+				{
+					pcl::PointXYZ rc = computeRoiConePos(pointCloud, target_on_right, jobInfo, savePath);
+					if (rc.x != -10000.f)
+					{
+						_cone_pos = rc; _coneSrc = 3;
+						if (wasMispick) { _landout_detected = false; LDO_Current_Count = 0; }
+						_target_cone = bbx();
+						_target_cone.index = (_detected_chassis_type == "IGH") ? 3 : 1;
+						_target_cone.label = (_detected_chassis_type == "IGH") ? "igh" : "cone";
+						_target_cone.prob = 50;
+						logMessage(std::string("[ROI_FB] no validated VA init -> ROI cone T:")
+							+ std::to_string((int)rc.x) + " (va " + (wasMispick ? "out-of-range" : "missed") + ")");
+						if (jobLog) jobLogMessage("[ROI_FB] ROI cone used (no VA init)");
+					}
+				}
+			}
+		}
+		else if (jobInfo.isOffloadCycle)
+		{
+			//Offload: MISS -> ROI only (no init reuse; landed idx2 vs unloaded idx1 makes the
+			//validated-init definition unreliable here).
+			bool missed = usePreset || (_target_cone.prob == 0) || (_cone_pos.x == -10000.f);
+			if (missed)
+			{
+				pcl::PointXYZ rc = computeRoiConePos(pointCloud, target_on_right, jobInfo, savePath);
+				if (rc.x != -10000.f)
+				{
+					_cone_pos = rc; _coneSrc = 3;
+					_target_cone = bbx();
+					_target_cone.index = (_detected_chassis_type == "IGH") ? 3 : 1;
+					_target_cone.label = (_detected_chassis_type == "IGH") ? "igh" : "cone";
+					_target_cone.prob = 50;
+					logMessage(std::string("[ROI_FB] offload VA cone missed -> ROI cone T:") + std::to_string((int)rc.x));
+				}
+			}
+		}
+	}
+#pragma endregion
+
+#pragma region FORCE_ROI_MODE - tracker update + A/B vs VA-mapped cone
+	pcl::PointXYZ _roi_detected(-10000.f, -10000.f, -10000.f);
+	if (FORCE_ROI_MODE)
+	{
+		//NEW targeting (XT): position_detection_pca above ran the cone detector on the FULL
+		//region, whose densest-slice can latch onto the BACK BODY (target drifts deep/low).
+		//Re-run the SAME detector on the NEAR-Z FACE (thin front slab) so the back body can't
+		//be selected, then set the plate-corner height locally. (The full-region result is
+		//still what position_detection_pca produced -- kept as OLD for the offline 3-way sheet.)
+		if (jobInfo.chassisType == "XT" && _pcCone->points.size() > 0)
+		{
+			//Isolated-flyer removal first: floating scatter above the cone otherwise
+			//inflates max-Y and pushes the upper-half mid-Y up (shaving the plate).
+			auto _roiClean = chassis_roi_sor(_pcCone);
+			auto _roiFace = chassis_roi_near_face(_roiClean, 80.f);
+			pcl::PointXYZ nc = pc_cone_detection_naive(_roiFace, target_on_right, "");
+			if (nc.x != -10000.f)
+			{
+				//Sparse-face rescue: on thin faces the detector's dense X stage stops short
+				//of the true edge column -- conditionally move the corner there (x,z only).
+				chassis_roi_sparse_edge_rescue(_roiFace, target_on_right, nc);
+				float ch = chassis_roi_corner_height(_roiFace, nc.x, nc.z);
+				if (ch != -10000.f) nc.y = ch;
+				_cone_pos = nc;
+
+				//Debug artifacts (batch): the face fed to the detector + the NEW target point.
+				if (savePath != std::string(""))
+				{
+					try
+					{
+						if (_roiFace->points.size() > 0)
+							pcl::io::savePCDFileBinaryCompressed(savePath + "_ROI_face.pcd", *_roiFace);
+						pcl::PointCloud<pcl::PointXYZ> tc; tc.points.push_back(nc);
+						tc.width = 1; tc.height = 1; tc.is_dense = true;
+						pcl::io::savePCDFileBinaryCompressed(savePath + "_ROI_target.pcd", tc);
+					}
+					catch (...) {}
+				}
+			}
+		}
+
+		//Position now comes from position_detection_pca run on the ROI-extracted region
+		//(set into _pcCone/_pcGuide above) -- no separate override. Feed THAT to the tracker.
+		_roi_detected = (jobInfo.chassisType == "CST") ? _guide_pos : _cone_pos;
+
+		chassisRoiTracker.update(_roi_detected, _sprd_landed_trigger, roiPrm,
+			[jobLog](const std::string& m) { logMessage(m); if (jobLog) jobLogMessage(m); });
+
+		//A/B: ROI-detected cone vs VA-mapped cone (same detector, both valid).
+		bool roiOk = (_roi_detected.x != -10000.f);
+		bool vaOk = (_ab_va_cone.x != -10000.f);
+		if (roiOk && vaOk)
+		{
+			_ab_dT = (int)(_roi_detected.x - _ab_va_cone.x);
+			_ab_dH = (int)(_roi_detected.y - _ab_va_cone.y);
+			_ab_dG = (int)(_roi_detected.z - _ab_va_cone.z);
+			_ab_valid = true;
+			logMessage("[ROI_AB] ROI-vs-VA cone delta (T:" + std::to_string(_ab_dT)
+				+ " H:" + std::to_string(_ab_dH) + " G:" + std::to_string(_ab_dG)
+				+ ")  ROI(T:" + std::to_string((int)_roi_detected.x) + " G:" + std::to_string((int)_roi_detected.z)
+				+ ") VA(T:" + std::to_string((int)_ab_va_cone.x) + " G:" + std::to_string((int)_ab_va_cone.z) + ")");
+			if (jobLog) jobLogMessage("[ROI_AB] ROI-vs-VA cone delta (T:" + std::to_string(_ab_dT)
+				+ " H:" + std::to_string(_ab_dH) + " G:" + std::to_string(_ab_dG) + ")");
+		}
+	}
+#pragma endregion
+
 #pragma region dev_out_in pca -- landout/clps included.
 	deviation_output_pca(isFrontSensor, target_on_right, jobInfo.isMountCycle, jobInfo.isOffloadCycle, _detected_chassis_type, _hole_pos, _cone_pos, _guide_pos, _sprd_landed_trigger, ref(_dvOut_pca_x), ref(_dvOut_pca_y), ref(_dvOut_pca_z), ref(_landout_detected_pca), ref(_clps_detected_pca), ref(_clps_ok_detected_pca));
 #pragma endregion
 
-	_Out_landout_detected = (_landout_detected || _landout_detected_pca);
-	_Out_clps_detected = (_clps_detected || _clps_detected_pca);
-	_Out_clps_ok_detected = (_clps_ok_detected || _clps_ok_detected_pca);
+#pragma region CLPS 3D (offload, XT/IGH) -- reverse-replay validated 2026-07
+	//Primary CLPS/CLPS-OK from the 3D target height: works with VA blind (18% of
+	//replayed jobs), immune to the partner-cone idx1 flap, and guards the
+	//"hoist paused with chassis dangling" case via the landedH+margin check.
+	bool _clps_3d = false, _clps_ok_3d = false;
+	if (jobInfo.isOffloadCycle && jobInfo.chassisType != "CST")
+	{
+		//twistlock-locked arm condition: PLC bit in live; debug/batch has no PLC.
+		bool twl = (MODE_DEBUG || DEBUG_BATCH_JOB || DEBUG_WITH_FILES) ? true : SPRD_TWL_Locked;
+		bool prevOk = clpsOffload3D.clpsOk(), prevCl = clpsOffload3D.clps();
+		clpsOffload3D.update(_eff_landed, twl, _cone_pos.y);
+		_clps_ok_3d = clpsOffload3D.clpsOk();
+		_clps_3d = clpsOffload3D.clps();
+		if (_clps_ok_3d && !prevOk)
+		{
+			logMessage("[CLPS3D] CLPS-OK Detected! H stable at " + std::to_string((int)_cone_pos.y)
+				+ " (landedH " + std::to_string((int)clpsOffload3D.landedH()) + ")");
+			if (jobLog) jobLogMessage("[CLPS3D] CLPS-OK Detected! H stable at " + std::to_string((int)_cone_pos.y));
+		}
+		if (_clps_3d && !prevCl)
+		{
+			logMessage("[CLPS3D] CLPS Detected! H " + std::to_string((int)_cone_pos.y)
+				+ " above landedH " + std::to_string((int)clpsOffload3D.landedH()) + " -> chassis lift suspected");
+			if (jobLog) jobLogMessage("[CLPS3D] CLPS Detected! chassis lift suspected");
+		}
+	}
+#pragma endregion
+
+	//Landout final output: VA ONLY for now (PCA landout intentionally NOT combined into the
+	//output -- _landout_detected_pca still computed & logged for diagnostics, just not sent).
+	_Out_landout_detected = _landout_detected;	//was: (_landout_detected || _landout_detected_pca)
+	_Out_clps_detected = (_clps_detected || _clps_detected_pca || _clps_3d);
+	_Out_clps_ok_detected = (_clps_ok_detected || _clps_ok_detected_pca || _clps_ok_3d);
+
+#pragma region 3D deviation OUTPUT multiplex (XT/IGH) -- position vs deviation
+	//What we SEND to the PLC on Dev_*_3D is phase-multiplexed. Detection above still ran
+	//on the realtime deviation (_dvOut_pca_*); this only shapes the output bytes.
+	//  MOUNT:   POSITION = latched chassis ref (cone/guide) until the hole is confirmed
+	//           in 3 cumulative VA frames -> then DEVIATION = hole(realtime) - ref(latched).
+	//  OFFLOAD: POSITION = latched hole (from job start) until the VA cone-idx1+hole
+	//           separation fires -> then DEVIATION with the cone latched from separation.
+	//The PLC infers position-vs-deviation from the existing VA detection bits (byte16)
+	//plus its own Landed bit -- no new protocol bits (offload phase-1 is landed, so the
+	//PLC's Landed gate keeps it from reading the latched hole position as a deviation).
+	//Non-XT/IGH (CST) keeps the realtime deviation unchanged.
+	int _dev3d_out_x = _dvOut_pca_x, _dev3d_out_y = _dvOut_pca_y, _dev3d_out_z = _dvOut_pca_z;
+	bool _dev3d_is_position = false;
+	if (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
+	{
+		const int x_offset = 14, z_offset = 26;						//legacy TUAS-3DSP offsets
+		//Chassis reference: position_detection_pca writes BOTH XT (idx1) and IGH (idx3) into
+		//_cone_pos (only CST uses _guide_pos, which is out of scope here). So _cone_pos for both.
+		pcl::PointXYZ chRef = _cone_pos;
+		const pcl::PointXYZ INVALID_PT(-10000, -10000, -10000);
+
+		auto finite3 = [](const pcl::PointXYZ& q)
+		{
+			return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z)
+				&& q.x != -10000 && q.y != -10000 && q.z != -10000;
+		};
+		auto devFromLatchedRef = [&](const pcl::PointXYZ& c)
+		{
+			if (finite3(_hole_pos) && finite3(c))
+			{
+				_dev3d_out_x = (int)(c.x - (target_on_right ? (_hole_pos.x + x_offset) : (_hole_pos.x - x_offset)));
+				_dev3d_out_y = (int)(c.y - _hole_pos.y);
+				_dev3d_out_z = (int)(c.z - (_hole_pos.z + z_offset));
+			}
+			else { _dev3d_out_x = _dev3d_out_y = _dev3d_out_z = -10000; }
+		};
+
+		if (jobInfo.isMountCycle)
+		{
+			DEV3D_RefLatch.push(chRef);								//latch chassis ref from job start
+			if (!DEV3D_mount_dev_phase && _target_hole.prob > 70)
+			{
+				DEV3D_mount_hole_count++;							//cumulative, not continuous
+				if (DEV3D_mount_hole_count >= 3) DEV3D_mount_dev_phase = true;
+			}
+			if (!DEV3D_mount_dev_phase)
+			{
+				pcl::PointXYZ p = DEV3D_RefLatch.value();		//sentinel (-10000) until locked
+				_dev3d_out_x = (int)p.x; _dev3d_out_y = (int)p.y; _dev3d_out_z = (int)p.z;
+				_dev3d_is_position = true;
+			}
+			else
+			{
+				devFromLatchedRef(DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : INVALID_PT);
+			}
+		}
+		else if (jobInfo.isOffloadCycle)
+		{
+			DEV3D_HoleLatch.push(_hole_pos);						//latch hole from job start
+			if (_clps_ok_detected) DEV3D_offload_dev_phase = true;	//VA cone-idx1+hole separation (sticky)
+			if (!DEV3D_offload_dev_phase)
+			{
+				pcl::PointXYZ p = DEV3D_HoleLatch.value();
+				_dev3d_out_x = (int)p.x; _dev3d_out_y = (int)p.y; _dev3d_out_z = (int)p.z;
+				_dev3d_is_position = true;
+			}
+			else
+			{
+				DEV3D_RefLatch.push(chRef);							//cone latch STARTS at separation
+				devFromLatchedRef(DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : chRef);
+			}
+		}
+	}
+#pragma endregion
 
 
 	logLines += std::to_string(_pcHole->points.size()) + ";" + std::to_string(_pcCone->points.size()) + ";" + std::to_string(_pcGuide->points.size()) + ";";
@@ -8973,6 +9679,54 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 	logLines += std::to_string(_Out_clps_detected) + ";" + std::to_string(_Out_clps_ok_detected);
 
+	if (FORCE_ROI_MODE)
+	{
+		//Extra columns (header extended in the batch thread when FORCE_ROI_MODE).
+		//ROI_T/H/G = ROI-detected cone (via the existing detector on the crop).
+		logLines += ";" + chassisRoiTracker.stateString() + ";";
+		logLines += std::to_string((int)_roi_detected.x) + ";" + std::to_string((int)_roi_detected.y) + ";" + std::to_string((int)_roi_detected.z) + ";";
+		logLines += std::to_string((int)_pcCone->points.size()) + ";";
+		logLines += std::to_string(_ab_valid) + ";" + std::to_string(_ab_dT) + ";" + std::to_string(_ab_dH) + ";" + std::to_string(_ab_dG);
+	}
+
+	//CLPS 3D diagnostics (appended LAST so earlier column indices stay stable):
+	//EffLanded = the landed used for gating (PLC in live / visual in debug);
+	//CLPS_3D / CLPSOK_3D = the INDIVIDUAL 3D verdicts (CLPS_OUT/CLPS_OK_OUT above are
+	//the combined VA||PCA||3D); LandedH_3D = learned loaded-phase H baseline.
+	logLines += ";" + std::to_string(_eff_landed) + ";" + std::to_string(_clps_3d) + ";" + std::to_string(_clps_ok_3d) + ";";
+	logLines += std::to_string((int)clpsOffload3D.landedH());
+
+	//3D deviation output multiplex (appended last): phase 0=n/a(CST) 1=position 2=deviation,
+	//then the multiplexed value actually sent to the PLC on Dev_*_3D.
+	int _dev3d_phase = (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH") ? (_dev3d_is_position ? 1 : 2) : 0;
+	logLines += ";" + std::to_string(_dev3d_phase) + ";" + std::to_string(_dev3d_out_x) + ";" + std::to_string(_dev3d_out_y) + ";" + std::to_string(_dev3d_out_z);
+	//Cone source: 0=VA current, 1=VA init(3D pos), 2=VA init(2D-box remap), 3=ROI fallback.
+	logLines += ";" + std::to_string(_coneSrc);
+
+	//===== process-result overlays (skim on debug images) =====
+	//flag helper: red when TRUE, grey when FALSE.
+	auto putFlag = [&](const std::string& name, bool v, int y)
+	{
+		cv::putText(res_image, name + (v ? ":TRUE" : ":FALSE"), cv::Point(0, y),
+			cv::FONT_HERSHEY_SIMPLEX, 0.8, v ? cv::Scalar(0, 0, 255) : cv::Scalar(180, 180, 180), 2);
+	};
+	//3D deviation OUTPUT actually sent on Dev_*_3D -- BOTH cycles. POS = latched position
+	//phase, DEV = deviation phase (hole-latched ref), N/A = non XT/IGH (realtime dev).
+	{
+		std::string ph = (_dev3d_phase == 1) ? "POS" : (_dev3d_phase == 2) ? "DEV" : "N/A";
+		cv::putText(res_image, std::string("3D-") + ph + ": " + std::to_string(_dev3d_out_x) + ","
+			+ std::to_string(_dev3d_out_y) + "," + std::to_string(_dev3d_out_z),
+			cv::Point(0, 50), cv::FONT_HERSHEY_SIMPLEX, 0.9, cv::Scalar(0, 255, 255), 2);
+	}
+	//Cone source when NOT the current-frame VA detection -- orange.
+	//1=validated VA init (3D pos), 2=validated VA init (2D-box remap), 3=ROI fallback.
+	if (_coneSrc != 0)
+	{
+		std::string src = (_coneSrc == 1) ? "VAinit-3D" : (_coneSrc == 2) ? "VAinit-box" : "ROI";
+		cv::putText(res_image, std::string("CONE_SRC:") + src, cv::Point(0, 80),
+			cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 165, 255), 2);
+	}
+
 	if (jobInfo.isOffloadCycle)
 	{
 		//CLPS-OK - VA
@@ -8981,6 +9735,13 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 		if (clps_ok_detected_pca) cv::putText(res_image, std::string("CLPS-OK_PCA:TRUE"), cv::Point(0, 140), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
 		else cv::putText(res_image, std::string("CLPS-OK_PCA:FALSE"), cv::Point(0, 140), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+
+		//combined outputs actually sent to the PLC (byte17) + per-pipeline breakdown.
+		putFlag("CLPS", _Out_clps_detected, 200);
+		putFlag("CLPSOK", _Out_clps_ok_detected, 230);
+		cv::putText(res_image, std::string("C va/pca/3d:") + (_clps_detected ? "1" : "0") + (_clps_detected_pca ? "1" : "0") + (_clps_3d ? "1" : "0")
+			+ "  OK:" + (_clps_ok_detected ? "1" : "0") + (_clps_ok_detected_pca ? "1" : "0") + (_clps_ok_3d ? "1" : "0"),
+			cv::Point(0, 260), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1);
 
 		/*
 		if (clps_ok_detected_pca_only) cv::putText(res_image, std::string("CLPS-SEP_PCA:TRUE : ") + std::to_string(pca_dev_y), cv::Point(0, 170), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
@@ -8997,6 +9758,11 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 		if (landout_detected_pca) cv::putText(res_image, std::string("LANDOUT_PCA:TRUE"), cv::Point(0, 170), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
 		else cv::putText(res_image, std::string("LANDOUT_PCA:FALSE"), cv::Point(0, 170), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
+
+		//combined landout actually sent to the PLC (byte17) + per-pipeline breakdown.
+		putFlag("LANDOUT", _Out_landout_detected, 200);
+		cv::putText(res_image, std::string("LDO va/pca:") + (_landout_detected ? "1" : "0") + (_landout_detected_pca ? "1" : "0"),
+			cv::Point(0, 230), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1);
 	}
 	
 
@@ -9036,9 +9802,11 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 	procResults.PCA_Target_Container = _hole_pos;
 	procResults.PCA_Target_Guide = _guide_pos;
-	procResults.PCA_Devout_X = _dvOut_pca_x;
-	procResults.PCA_Devout_Y = _dvOut_pca_y;
-	procResults.PCA_Devout_Z = _dvOut_pca_z;
+	//Multiplexed output (position in phase 1 / deviation in phase 2 for XT/IGH; realtime
+	//deviation otherwise). Realtime deviation stays in _dvOut_pca_* (res.txt + detection).
+	procResults.PCA_Devout_X = _dev3d_out_x;
+	procResults.PCA_Devout_Y = _dev3d_out_y;
+	procResults.PCA_Devout_Z = _dev3d_out_z;
 	procResults.PCA_isLandout = _landout_detected_pca;
 	procResults.PCA_isCLPS = _clps_detected_pca;
 	procResults.PCA_isCLPS_OK = _clps_ok_detected_pca;
@@ -9074,7 +9842,13 @@ void processingThread()
 					current_job_info.print_jobInfo();
 
 					//data log file.
-					auto logHeader = std::string("Filename;Hole_x;Hole_y;Hole_w;Hole_h;Hole_prob;XT_index;XT_x;XT_y;XT_w;XT_h;XT_prob;Guide_x;Guide_y;Guide_w;Guide_y;Guide_prob;devout_x;devout_y;devout_x_mm;devout_y_mm;Landed_Trigger;Landout_Detected;CLPS_Detected;CLPS_OK;Hole_pc;Cone_pc;Guide_pc;hole_x;hole_y;hole_z;cone_x;cone_y;cone_z;devout_pca_x;devout_pca_y;devout_pca_z;landout_pca;clps_pca;clpsOk_pca;pcUnderHole;LDO_VA_Count;LDO_PCA_Count;CLPS_VA_Count;CLPS_PCA_Count;CLPSOK_PCA_Count;CLPS_Y_LEVEL;CLPS_PCA_ONLY_SEP;SEP_DEV_Y");
+					auto logHeader = std::string("Filename;Hole_x;Hole_y;Hole_w;Hole_h;Hole_prob;XT_index;XT_x;XT_y;XT_w;XT_h;XT_prob;Guide_x;Guide_y;Guide_w;Guide_y;Guide_prob;devout_x;devout_y;devout_x_mm;devout_y_mm;Landed_Trigger;Landout_Detected;CLPS_Detected;CLPS_OK;Hole_pc;Cone_pc;Guide_pc;hole_x;hole_y;hole_z;cone_x;cone_y;cone_z;devout_pca_x;devout_pca_y;devout_pca_z;landout_pca;clps_pca;clpsOk_pca;pcUnderHole;LDO_VA_Count;LDO_PCA_Count;CLPS_VA_Count;CLPS_PCA_Count;CLPSOK_PCA_Count;CLPS_Y_LEVEL;CLPS_PCA_ONLY_SEP;SEP_DEV_Y;CLPS_OUT;CLPS_OK_OUT");
+					//Keep IDENTICAL to the batch header (OfflineDebugBatchProcessingThread) so the
+					//live res.txt columns line up with the log_lines data (ProcessLogic appends all
+					//of these). FORCE_ROI columns are conditional; the rest are always present.
+					if (FORCE_ROI_MODE) logHeader += ";ROI_State;ROI_T;ROI_H;ROI_G;ROI_CropPts;AB_Valid;AB_dT;AB_dH;AB_dG";
+					logHeader += ";EffLanded;CLPS_3D;CLPSOK_3D;LandedH_3D";
+					logHeader += ";Dev3D_Phase;Dev3D_OutX;Dev3D_OutY;Dev3D_OutZ;ConeSrc";
 
 					ofstream Simfile;
 					std::string sim_result_txt = job_result_folder_name + "/" + job_name + "_res.txt";
@@ -9264,12 +10038,26 @@ void OfflineDebugBatchProcessingThread()
 		Simfile_batch.close();
 	}
 
-	for (const auto& jobDir : jobDirectories)
+	//Work list: with ENABLE_MOUNT_REVERSE every Mount job is processed TWICE --
+	//pass 0 = forward (normal Mount), pass 1 = frames reversed and treated as OFFLOAD
+	//(the only sequence data with the separation phase). Results are split into
+	//Mount_Result/ and Offload_Result/ under DEBUG_BATCH_SAVE_DIR.
+	std::vector<std::pair<std::string, bool>> workItems;
+	for (const auto& d : jobDirectories)
 	{
+		workItems.push_back(std::make_pair(d, false));
+		if (ENABLE_MOUNT_REVERSE) workItems.push_back(std::make_pair(d, true));
+	}
+
+	for (const auto& workItem : workItems)
+	{
+		const std::string& jobDir = workItem.first;
+		const bool reversePass = workItem.second;
+
 		reset_recvVariables();
 		reset_jobVariables();
 
-		logMessage("Processing: " + jobDir);
+		logMessage("Processing: " + jobDir + (reversePass ? "  [REVERSE pass]" : ""));
 
 		//load .jpg, .pcd files for processing
 		auto image_filePath = jobDir + "/" + std::string("Image");
@@ -9278,17 +10066,49 @@ void OfflineDebugBatchProcessingThread()
 		std::filesystem::path pathObj = std::filesystem::path(jobDir).lexically_normal();
 		std::string lastDirectory = pathObj.filename().string();
 
+		//Only process current-site recordings. Accepted: FS*/CS* prefixed
+		//folders (new naming) or folders with the _FRONT_/_REAR_ sensor token
+		//(2026 era). Excluded: *TMINI_LEFT/RIGHT* (other-site/older era) and
+		//anything else (e.g. nested result folders).
+		{
+			std::string upperName = lastDirectory;
+			std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+
+			bool isOldEra = (upperName.find("TMINI") != std::string::npos);
+			bool hasSitePrefix = (upperName.rfind("FS", 0) == 0) || (upperName.rfind("CS", 0) == 0);
+			bool hasSensorToken = (upperName.find("_FRONT_") != std::string::npos) || (upperName.find("_REAR_") != std::string::npos);
+
+			if (isOldEra || (!hasSitePrefix && !hasSensorToken))
+			{
+				logMessage("Skipping non-site folder: " + lastDirectory);
+				continue;
+			}
+		}
+
+		//The reverse pass only applies to Mount jobs (reversing a real Offload job
+		//would fabricate a mount) -- skip its reverse work item.
+		bool nameIsMount = (lastDirectory.find("Mount") != std::string::npos);
+		if (reversePass && !nameIsMount) continue;
+
 		bool loadedPLY = false;
 		auto image_files = getAllFiles(image_filePath, ".jpg");
 		auto depth_files = getAllFiles(depth_filePath, ".pcd");
-		if (depth_files.size() == 0) 
+		if (depth_files.size() == 0)
 		{
-			depth_files = getAllFiles(depth_filePath, ".ply"); 
+			depth_files = getAllFiles(depth_filePath, ".ply");
 			loadedPLY = true;
 		}
 
 		createDirectory_ifexists(DEBUG_BATCH_SAVE_DIR);
-		auto save_file_path = DEBUG_BATCH_SAVE_DIR + "/" + lastDirectory;
+		std::string cycleRoot = DEBUG_BATCH_SAVE_DIR;
+		if (false)//ENABLE_MOUNT_REVERSE)
+		{
+			//Split results by the EFFECTIVE cycle: forward Mount -> Mount_Result/,
+			//reversed Mount (and native Offload jobs) -> Offload_Result/.
+			cycleRoot += std::string("/") + ((nameIsMount && !reversePass) ? "Mount_Result" : "Offload_Result");
+			createDirectory_ifexists(cycleRoot);
+		}
+		auto save_file_path = cycleRoot + "/" + lastDirectory;
 		auto folder_created = createDirectory_ifexists(save_file_path);
 
 		if (!folder_created)
@@ -9300,6 +10120,9 @@ void OfflineDebugBatchProcessingThread()
 		logMessage("Saving to " + save_file_path);
 
 		auto logHeader = std::string("Filename;Hole_x;Hole_y;Hole_w;Hole_h;Hole_prob;XT_index;XT_x;XT_y;XT_w;XT_h;XT_prob;Guide_x;Guide_y;Guide_w;Guide_y;Guide_prob;devout_x;devout_y;devout_x_mm;devout_y_mm;Landed_Trigger;Landout_Detected;CLPS_Detected;CLPS_OK;Hole_pc;Cone_pc;Guide_pc;hole_x;hole_y;hole_z;cone_x;cone_y;cone_z;devout_pca_x;devout_pca_y;devout_pca_z;landout_pca;clps_pca;clpsOk_pca;pcUnderHole;LDO_VA_Count;LDO_PCA_Count;CLPS_VA_Count;CLPS_PCA_Count;CLPSOK_PCA_Count;CLPS_Y_LEVEL;CLPS_PCA_ONLY_SEP;SEP_DEV_Y;CLPS_OUT;CLPS_OK_OUT");
+		if (FORCE_ROI_MODE) logHeader += ";ROI_State;ROI_T;ROI_H;ROI_G;ROI_CropPts;AB_Valid;AB_dT;AB_dH;AB_dG";
+		logHeader += ";EffLanded;CLPS_3D;CLPSOK_3D;LandedH_3D";
+		logHeader += ";Dev3D_Phase;Dev3D_OutX;Dev3D_OutY;Dev3D_OutZ;ConeSrc";
 
 		ofstream Simfile;
 		std::string sim_result_txt = save_file_path + "/" + lastDirectory + "_res.txt";
@@ -9314,41 +10137,63 @@ void OfflineDebugBatchProcessingThread()
 			Simfile.close();
 		}
 
-		//Get job information from the folder name.
+		//Get job information from the folder name. Tokens are located relative
+		//to the Mount/Offload token, so both old ({ts}_{Bn}_...) and
+		//site-prefixed (FS_/CS_...) folder names parse correctly.
 		auto info_temp = split(lastDirectory, '_');
-		if (info_temp.size() > 4)
+		int cycleIdx = -1;
+		for (int t = 0; t < (int)info_temp.size(); t++)
 		{
-			if (info_temp[4] == "Mount")
+			if (info_temp[t] == "Mount" || info_temp[t] == "Offload") { cycleIdx = t; break; }
+		}
+
+		if (cycleIdx >= 0)
+		{
+			if (info_temp[cycleIdx] == "Mount")
 			{
 				Mount_Cycle = true;
 				Offload_Cycle = false;
 				logMessage("Mount Cycle Detected");
 			}
-			else if (info_temp[4] == "Offload")
+			else
 			{
 				Offload_Cycle = true;
 				Mount_Cycle = false;
 				logMessage("Offload Cycle Detected");
 			}
 		}
-		
+
+		//Reverse pass: play the Mount job BACKWARDS and process it as an OFFLOAD
+		//(landed -> hoist -> separation -> cone-only). Real offload recordings all end
+		//while landed, so this is the only sequence data with the separation phase --
+		//used to exercise CLPS / CLPS-OK offline. Image and depth lists are
+		//index-paired, so both are reversed together.
+		if (reversePass && Mount_Cycle)
+		{
+			Offload_Cycle = true;
+			Mount_Cycle = false;
+			std::reverse(image_files.begin(), image_files.end());
+			std::reverse(depth_files.begin(), depth_files.end());
+			logMessage("[MOUNT-REVERSE] Mount job replayed BACKWARDS as OFFLOAD: " + lastDirectory);
+		}
+
 		std::string job_pos = "Center";
 		std::string chs_type = "XT";
 		int chs_size = 40;
 		int sprd_size = 40;
 
-		if (info_temp.size() > 7)
+		if (cycleIdx >= 0 && (int)info_temp.size() > cycleIdx + 4)
 		{
-			job_pos = (info_temp[5] != "None") ? info_temp[5] : "Center";
+			job_pos = (info_temp[cycleIdx + 1] != "None") ? info_temp[cycleIdx + 1] : "Center";
 
-			chs_type = (info_temp[6] != "None") ? info_temp[6] : "XT";
-			
+			chs_type = (info_temp[cycleIdx + 2] != "None") ? info_temp[cycleIdx + 2] : "XT";
 
-			if (info_temp[7] == "CHS45") chs_size = 45;	
-			else if (info_temp[7] == "CHS20") chs_size = 20;
-			
-			if (info_temp[8] == "SPRD45") sprd_size = 45;
-			else if (info_temp[8] == "SRPD20") sprd_size = 20;
+
+			if (info_temp[cycleIdx + 3] == "CHS45") chs_size = 45;
+			else if (info_temp[cycleIdx + 3] == "CHS20") chs_size = 20;
+
+			if (info_temp[cycleIdx + 4] == "SPRD45") sprd_size = 45;
+			else if (info_temp[cycleIdx + 4] == "SPRD20" || info_temp[cycleIdx + 4] == "SRPD20") sprd_size = 20;
 		}
 
 		bbx presetTarget;
@@ -9437,9 +10282,13 @@ void OfflineDebugBatchProcessingThread()
 
 		//2025.03.11
 		bool debug_landed_trigger = false;
+		//every 10 files.
+		int procSkip = 5;
 
 		for (int i = 0; i < image_files.size(); i++)
 		{
+			if (i % procSkip != 0) continue;
+
 			logMessage("Processing Cycle Start!");
 
 			std::filesystem::path pathObj(image_files.at(i));
@@ -9798,10 +10647,10 @@ int main(int argc, char* argv[])
 	parseIPINI(app_path);
 
 	//TensorRT
-	if (!ENABLE_IMAGE_LOGGING_ONLY)
+	if (!ENABLE_IMAGE_LOGGING_ONLY && false)
 	{
 		try {
-			if (!trt_detector.loadEngine("model/20251201_TUAS_SEndfeed_3DSP.engine")) {
+			if (!trt_detector.loadEngine("model/20260702_TUAS_SEF_3DSP.engine")) {
 				printf("loadEngine failed\n");
 			}
 
@@ -9876,7 +10725,7 @@ int main(int argc, char* argv[])
 	}
 
 	//YOLOv11
-	/*
+	
 	bool useGPU = true;
 	
 	std::string modelPath = app_path + "/" + onnx_model_path;
@@ -9899,7 +10748,7 @@ int main(int argc, char* argv[])
 
 	// Perform detection with the updated thresholds
 	std::vector<Detection> detections = yolo_detector.detect(frame, confThreshold, iouThreshold);
-	*/
+	
 	//auto end_time = std::chrono::high_resolution_clock::now();
 	//auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
