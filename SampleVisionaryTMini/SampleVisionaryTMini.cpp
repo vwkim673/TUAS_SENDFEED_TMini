@@ -9012,6 +9012,29 @@ void fillRoiParams(const JobInfo& jobInfo, ChassisRoiParams& roiPrm)
 			else                               roiPrm.coneY = (float)presetPos.R_XT_4XR_CY;
 		}
 	}
+	else if (jobInfo.chassisType == "IGH")
+	{
+		//IGH crop is SEPARATE from XT -- own X/Y/Z, NOT the shared HEIGHT_MMR/TROLLEY_MMR or the
+		//colliding IGH_4XF RNG key. Sized from the GT spread (roi_igh_eval / igh_spread analysis):
+		//the CS(REAR) guides span Z~1222..1842 and X wide (merged ~480mm), larger than XT's fixed
+		//window. TODO: lift these to dedicated IGH INI keys.
+		roiPrm.yMin = -600.f; roiPrm.yMax = 100.f;			//Y (Height): guide + targets (up to ~56)
+		if (CURRENT_SENSOR_POSITION == "FRONT")				//FS sensor
+		{
+			roiPrm.xMin = 500.f;  roiPrm.xMax = 1150.f;		//X (Gantry): GT 796..927 + margin
+			roiPrm.zMin = 1400.f; roiPrm.zMax = 2050.f;		//Z (Trolley): GT 1521..1776 + margin
+			roiPrm.coneY = (jobInfo.chassisLen == 45) ? -7.f : -4.f;	//guide TOP height
+		}
+		else												//CS sensor (REAR app, Center)
+		{
+			roiPrm.xMin = 350.f;  roiPrm.xMax = 1300.f;		//X: GT 512..1035 (merged whole)
+			roiPrm.zMin = 1150.f; roiPrm.zMax = 2050.f;		//Z: GT 1222..1842 (near-Z front included)
+			roiPrm.coneY = (jobInfo.chassisLen == 45) ? -66.f : -77.f;
+			//MERGED long guide (CHS40, ~480mm): widen the region xspan so the WHOLE guide is
+			//passed on (default 300mm crops both ends). cx is already the merged centre.
+			if (jobInfo.chassisLen == 40) roiPrm.xspan = 600.f;
+		}
+	}
 
 	//WIDE CROP override -- close-range XT Center 40chs/20job (F app -> Center sensor, 20F).
 	//Widen ONLY the crop p.x window (the Gantry / front-back axis the two cones split along)
@@ -9024,6 +9047,31 @@ void fillRoiParams(const JobInfo& jobInfo, ChassisRoiParams& roiPrm)
 		roiPrm.xMin = (float)ROI_WIDE_20F_MIN;
 		roiPrm.xMax = (float)ROI_WIDE_20F_MAX;
 	}
+}
+
+//IGH target = the GUIDE's TOP-LEFT corner. Reuses the XT near-face corner detector for the
+//lateral/depth (x,z), then OVERRIDES the height to the GUIDE TOP (dense-max Y at the corner
+//column over the SOR'd region) instead of the XT plate-corner height (~90mm below the guide
+//top). Port of tools/roi_igh_eval.py:target_ightop (dT<=9 on the 3 single-guide configs).
+//A MERGED long guide (CS 40chs) is one continuous structure, so `region` is the WHOLE guide
+//and the corner is the whole-guide corner (site targeting offset still TBD).
+//`region` = the extracted guide+plate region (chassis_roi_extract_region output).
+pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool target_on_right)
+{
+	pcl::PointXYZ inv(-10000.f, -10000.f, -10000.f);
+	if (!region || (int)region->points.size() < 30) return inv;
+	auto clean = chassis_roi_sor(region);
+	if ((int)clean->points.size() < 30) clean = region;
+	pcl::PointCloud<pcl::PointXYZ>::Ptr face = chassis_roi_near_face(clean, 80.f);	//upper-half + near-Z
+	pcl::PointXYZ nc = pc_cone_detection_naive(face, target_on_right, "");			//= new_target corner
+	if (nc.x == -10000.f) return inv;
+	chassis_roi_sparse_edge_rescue(face, target_on_right, nc);
+	//Y -> GUIDE TOP: dense-max Y in the corner X-column over the (SOR'd) region.
+	std::vector<float> colY;
+	for (const auto& p : clean->points)
+		if (std::fabs(p.x - nc.x) <= 60.f) colY.push_back(p.y);
+	if ((int)colY.size() >= 10) nc.y = chassis_roi_detail::denseExtreme(colY, 40.f, 10, true);
+	return nc;
 }
 
 //Localize the chassis cone from the preset ROI (VA-independent), returning a WORLD point
@@ -9043,7 +9091,7 @@ pcl::PointXYZ computeRoiConePos(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, 
 
 		if (jobInfo.chassisType == "IGH")
 		{
-			result = pc_IGH_detection_naive(region, target_on_right, "");
+			result = igh_target_from_region(region, target_on_right);	//guide top-left corner
 		}
 		else //XT
 		{
@@ -9515,6 +9563,30 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 						if (_roiFace->points.size() > 0)
 							pcl::io::savePCDFileBinaryCompressed(savePath + "_ROI_face.pcd", *_roiFace);
 						pcl::PointCloud<pcl::PointXYZ> tc; tc.points.push_back(nc);
+						tc.width = 1; tc.height = 1; tc.is_dense = true;
+						pcl::io::savePCDFileBinaryCompressed(savePath + "_ROI_target.pcd", tc);
+					}
+					catch (...) {}
+				}
+			}
+		}
+
+		//IGH: guide top-left corner refine (guide-top height) on the ROI-extracted region,
+		//replacing the pc_IGH_detection_naive result. Same rule as computeRoiConePos.
+		if (jobInfo.chassisType == "IGH" && _pcCone->points.size() > 0)
+		{
+			pcl::PointXYZ ig = igh_target_from_region(_pcCone, target_on_right);
+			if (ig.x != -10000.f)
+			{
+				_cone_pos = ig;
+				if (savePath != std::string(""))
+				{
+					try {
+						//_Region = the guide+plate region we pass on (matches the Python dump
+						//naming so it can be compared vs GT in the same tool); _tgt = target point.
+						if (_pcCone->points.size() > 0)
+							pcl::io::savePCDFileBinaryCompressed(savePath + "_Region.pcd", *_pcCone);
+						pcl::PointCloud<pcl::PointXYZ> tc; tc.points.push_back(ig);
 						tc.width = 1; tc.height = 1; tc.is_dense = true;
 						pcl::io::savePCDFileBinaryCompressed(savePath + "_ROI_target.pcd", tc);
 					}
