@@ -393,6 +393,18 @@ struct PRESET_POS
 	int R_XT_4XF_CY = -438; int R_XT_4XR_CY = -323; int R_XT_20F_CY = -435;
 	//4XR values re-derived 2026-07 from the new Center-CHS45-SPRD40 GT samples
 	//(FS cluster H mean -148, RS cluster H mean -323; opposite-cone outlier job excluded).
+
+	//IGH ROI crop box (VA-backup 3D localisation). IGH's crop differs from XT in every axis
+	//AND per CHS length (guide-top height + merged-vs-single xspan), which the shared preset
+	//key scheme (Big CHS40/45 -> one key) cannot express -- so IGH gets dedicated per-length
+	//keys. Defaults below == the offline-validated hardcode (IGH_AppState 2026-07); optional
+	//process.ini PRESET_*_3D IGH_ROI_40/45 keys override them.
+	//Fields: xMax; xMin; yMax; yMin; zMax; zMin; coneY (guide top); xspan (lateral window).
+	struct IGH_ROI_BOX { float xMax, xMin, yMax, yMin, zMax, zMin, coneY, xspan; };
+	IGH_ROI_BOX F_IGH_ROI_40 = { 1150.f, 500.f, 100.f, -600.f, 2050.f, 1400.f,  -4.f, 300.f };
+	IGH_ROI_BOX F_IGH_ROI_45 = { 1150.f, 500.f, 100.f, -600.f, 2050.f, 1400.f,  -7.f, 300.f };
+	IGH_ROI_BOX R_IGH_ROI_40 = { 1300.f, 350.f, 100.f, -600.f, 2050.f, 1150.f, -77.f, 600.f };	//merged whole guide
+	IGH_ROI_BOX R_IGH_ROI_45 = { 1300.f, 350.f, 100.f, -600.f, 2050.f, 1150.f, -66.f, 300.f };
 };
 
 struct JobInfo
@@ -562,6 +574,12 @@ int ROI_MIN_POINTS = 50;	//min points to accept the cone/guide body
 //so widening the crop does NOT weaken the mis-pick check for this config.
 int ROI_WIDE_20F_MAX = -10000;
 int ROI_WIDE_20F_MIN = -10000;
+//Corner-casting width (mm, spec). 2-cone (40ft center) deviation shifts the hole reference
+//out by this to align it with the target cone's END corner. process.ini [SETTINGS] override.
+int CORNER_CASTING_W = 167;
+//2-cone (40ft center) cone END inset: target = outer X extreme inset inward by this (~cone
+//half-width). GT-validated ~130mm. process.ini [SETTINGS] override.
+int XT_TWOCONE_INSET = 130;
 ChassisRoiTracker chassisRoiTracker;
 ClpsOffload3D clpsOffload3D;	//3D CLPS / CLPS-OK (offload), reverse-replay validated
 
@@ -638,6 +656,12 @@ bool Connected_Sensor_Reboot = false, Application_Shutdown = false;
 //T-Mini Application ---> PLC_Crane
 bool model_loaded = false, model_initialized = false;
 bool sensor_connected = false, sensor_fault = false;
+//Sensor reconnection policy (process.ini [SETTINGS], optional). MAX_RECONNECT_ATTEMPTS=0 => retry
+//forever; else give up after N consecutive failed setups (fault stays latched for the PLC).
+//STREAM_FRAME_TIMEOUT = ms with no new frame while streaming => treat as a disconnect + reconnect.
+int MAX_RECONNECT_ATTEMPTS = 10;
+int STREAM_FRAME_TIMEOUT = 2000;
+int reconnect_attempts = 0;			//consecutive failed setups in the current reconnect cycle
 bool enabled_stream = false, enabled_process = false, enabled_logging = false;
 
 short Detected_Chs_X_VA = 0, Detected_Chs_Y_VA = 0, Detected_Chs_Prob = 0;
@@ -1429,6 +1453,28 @@ void parseProcessINI(string path)
 			catch (...) {}	//non-numeric 3rd field (comment) -> keep default
 		};
 
+		//Optional IGH ROI crop box = 8-field key (xMax;xMin;yMax;yMin;zMax;zMin;coneY;xspan).
+		//Absent key -> struct defaults kept. Throw-safe & partial-apply (a trailing comment or
+		//short line keeps the remaining fields at their defaults) so it can never abort parsing.
+		auto parseIghRoi = [&](const std::string& section, const std::string& key, PRESET_POS::IGH_ROI_BOX& dst)
+		{
+			if (!ini.get(section).has(key)) return;
+			auto v = ini.get(section).get(key);
+			remove_all_whitespace(v);
+			auto ps = split_semicolon(v);
+			try {
+				if (ps.size() > 0) dst.xMax  = std::stof(ps.at(0));
+				if (ps.size() > 1) dst.xMin  = std::stof(ps.at(1));
+				if (ps.size() > 2) dst.yMax  = std::stof(ps.at(2));
+				if (ps.size() > 3) dst.yMin  = std::stof(ps.at(3));
+				if (ps.size() > 4) dst.zMax  = std::stof(ps.at(4));
+				if (ps.size() > 5) dst.zMin  = std::stof(ps.at(5));
+				if (ps.size() > 6) dst.coneY = std::stof(ps.at(6));
+				if (ps.size() > 7) dst.xspan = std::stof(ps.at(7));
+			}
+			catch (...) {}	//non-numeric field (e.g. trailing comment) -> keep defaults from here on
+		};
+
 		try
 		{
 
@@ -1460,6 +1506,10 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("ROI_CONE_MIN_H")) ROI_CONE_MIN_H = std::stoi(ini.get("SETTINGS").get("ROI_CONE_MIN_H"));
 			if (ini.get("SETTINGS").has("ROI_CONE_MAX_H")) ROI_CONE_MAX_H = std::stoi(ini.get("SETTINGS").get("ROI_CONE_MAX_H"));
 			if (ini.get("SETTINGS").has("ROI_MIN_POINTS")) ROI_MIN_POINTS = std::stoi(ini.get("SETTINGS").get("ROI_MIN_POINTS"));
+			if (ini.get("SETTINGS").has("CORNER_CASTING_W")) CORNER_CASTING_W = std::stoi(ini.get("SETTINGS").get("CORNER_CASTING_W"));
+			if (ini.get("SETTINGS").has("XT_TWOCONE_INSET")) XT_TWOCONE_INSET = std::stoi(ini.get("SETTINGS").get("XT_TWOCONE_INSET"));
+			if (ini.get("SETTINGS").has("MAX_RECONNECT_ATTEMPTS")) MAX_RECONNECT_ATTEMPTS = std::stoi(ini.get("SETTINGS").get("MAX_RECONNECT_ATTEMPTS"));
+			if (ini.get("SETTINGS").has("STREAM_FRAME_TIMEOUT")) STREAM_FRAME_TIMEOUT = std::stoi(ini.get("SETTINGS").get("STREAM_FRAME_TIMEOUT"));
 			logMessage("[INI] FORCE_ROI_MODE: " + std::to_string(FORCE_ROI_MODE)
 				+ " (LOCK_K:" + std::to_string(ROI_LOCK_K)
 				+ " LOCK_TOL:" + std::to_string(ROI_LOCK_TOL)
@@ -1528,6 +1578,12 @@ void parseProcessINI(string path)
 
 			presetPos.F_IGH_20R_RNG.MAX = std::stoi(tParts.at(0));
 			presetPos.F_IGH_20R_RNG.MIN = std::stoi(tParts.at(1));
+
+			//IGH ROI crop boxes (VA-backup) -- per sensor + CHS length (optional keys).
+			parseIghRoi("PRESET_FRONT_3D", "IGH_ROI_40", presetPos.F_IGH_ROI_40);
+			parseIghRoi("PRESET_FRONT_3D", "IGH_ROI_45", presetPos.F_IGH_ROI_45);
+			parseIghRoi("PRESET_REAR_3D",  "IGH_ROI_40", presetPos.R_IGH_ROI_40);
+			parseIghRoi("PRESET_REAR_3D",  "IGH_ROI_45", presetPos.R_IGH_ROI_45);
 
 			//CST
 			tVal = ini.get("PRESET_FRONT_3D").get("CST_4XF");
@@ -2288,11 +2344,15 @@ auto makeCommand(char* sendbuf) -> void {
 			sendbuf[29] = static_cast<char>(second_half.to_ulong());
 		}
 
-		//3D Process Results
+		//3D Process Results -- PCA/3D verdicts to the PLC are DISABLED (2026-07-14): the PLC must
+		//reference VA-only (byte17) until the PCA/3D CLPS paths are validated against real offload
+		//separation recordings. The verdicts are still computed & kept in the res.txt/log columns
+		//(landout_pca/clps_pca/clpsOk_pca, CLPS_3D/CLPSOK_3D) for that offline verification. byte30
+		//is held at 0 (frame position preserved). Re-enable by restoring the three set() calls:
+		//  if (current_process_results.PCA_isLandout) op_byte_30.set(0);
+		//  if (current_process_results.PCA_isCLPS)    op_byte_30.set(1);
+		//  if (current_process_results.PCA_isCLPS_OK) op_byte_30.set(2);
 		std::bitset<8>op_byte_30(0);
-		if (current_process_results.PCA_isLandout) op_byte_30.set(0);
-		if (current_process_results.PCA_isCLPS) op_byte_30.set(1);
-		if (current_process_results.PCA_isCLPS_OK) op_byte_30.set(2);
 		sendbuf[30] = static_cast<char>(op_byte_30.to_ulong());
 
 		//Dev_X_VA
@@ -2649,34 +2709,24 @@ void parseCommand(char recvbuf[])
 			}
 			enable_process = tempVal;
 
-			//sensor re-connection check.
-			if (enable_process && false)
+			//Sensor re-connection BACKUP check (command-driven). Primary reconnect is stream-stall
+			//driven (thread_tmini_data_stream). This is the safety net: if the process is enabled
+			//but the sensor is disconnected AND we are NOT already retrying (i.e. the control loop
+			//gave up after MAX_RECONNECT_ATTEMPTS), start a FRESH reconnect cycle after a cooldown.
+			//sensor_fault is NOT cleared here -- it stays visible to the PLC until we reconnect.
+			if (enable_process && !sensor_connected && !tmini_ctrl_flag)
 			{
-				if (!sensor_connected) //comm fault.
+				auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - sensor_last_attempted_time).count();
+				if (ts > 10000) //10s cooldown since the last setup attempt
 				{
-					auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - sensor_last_attempted_time).count();
-					if (ts > 10000) //10 seconds
+					logMessage("Sensor disconnected & idle -> starting a fresh reconnect cycle.");
+					reconnect_attempts = 0;
 					{
-						logMessage("Sensor Connection Fault Detected! Attempting to reconnect...");
-						sensor_connected = false;
-						sensor_fault = false;
-						{
-							std::unique_lock<std::mutex> lock(mutex_tmini_ctrl);
-							tmini_ctrl_flag = true; //wake tmini ctrl thread.
-						}
-						cond_tmini_ctrl.notify_one();
+						std::unique_lock<std::mutex> lock(mutex_tmini_ctrl);
+						tmini_ctrl_flag = true; //wake tmini ctrl thread.
 					}
+					cond_tmini_ctrl.notify_one();
 				}
-
-				if (sensor_fault)
-				{
-					if (sensor_connected)
-					{
-						//Disconnect from current sensor and try to reconnect.
-						; 
-					}
-				}
-
 			}
 
 			if (ENABLE_SAVE_LOG_BIT && trigger_log_delete && !enable_logging)
@@ -6351,6 +6401,7 @@ void thread_tmini_control()
 							sensor_last_connected_time = std::chrono::system_clock::now();
 							sensor_connected = true;
 							sensor_fault = false;
+							reconnect_attempts = 0;			//connected -> reset the retry counter
 
 							tmini_ctrl_flag = false; //dont enter this loop again.
 
@@ -6362,11 +6413,21 @@ void thread_tmini_control()
 						}
 						else
 						{
-
 							sensor_connected = false;
-							sensor_fault = true;
+							sensor_fault = true;			//latched fault while not connected
+							reconnect_attempts++;
 
-							logMessage("TMini Setup Failed!");
+							logMessage("TMini Setup Failed! (attempt " + std::to_string(reconnect_attempts)
+								+ (MAX_RECONNECT_ATTEMPTS > 0 ? "/" + std::to_string(MAX_RECONNECT_ATTEMPTS) : "") + ")");
+
+							//Retry-count limit: after N consecutive failures give up so we don't spin
+							//forever; sensor_fault stays TRUE for the PLC. A new enable (or stream
+							//fault) starts a fresh reconnect cycle.
+							if (MAX_RECONNECT_ATTEMPTS > 0 && reconnect_attempts >= MAX_RECONNECT_ATTEMPTS)
+							{
+								logMessage("Max reconnect attempts reached -> giving up (sensor FAULT).");
+								tmini_ctrl_flag = false;	//exit the reconnect loop; fault latched
+							}
 						}
 					}
 					else
@@ -6449,9 +6510,20 @@ auto tmini_data_stream() -> void
 		//cv::namedWindow("T Mini", cv::WINDOW_AUTOSIZE);
 		
 		if (tmini_data_stream_flag) logMessage("Data Streaming Ready & Starting!");
+		last_frame_get_time = std::chrono::system_clock::now();	//reset the stall timer at stream start
 		while (tmini_data_stream_flag)
 		{
 			auto waitDur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - last_frame_get_time).count();
+			//Stream stall == disconnect: no new frame for STREAM_FRAME_TIMEOUT ms. The step/grab
+			//failures below only sleep+continue, so without this a silent sensor drop would keep
+			//connected=true forever. Break -> the stream wrapper marks fault and triggers reconnect.
+			if (waitDur_ms > STREAM_FRAME_TIMEOUT)
+			{
+				logMessage("[TMini-Data-Stream] No frame for " + std::to_string(waitDur_ms) + "ms -> sensor disconnect.");
+				sensor_connected = false;
+				sensor_fault = true;
+				break;
+			}
 			if (waitDur_ms > 150)
 			{
 				blnGetNewFrame = false;
@@ -6605,13 +6677,30 @@ void thread_tmini_data_stream()
 			{
 				proc_running.store(true);
 
-				tmini_data_stream();
-		
-				//deflag sensor related bits.
-				sensor_connected = false;
-				sensor_fault = false;
+				tmini_data_stream();		//returns on clean disable OR on a stream stall/error
 
-				logMessage("Sensor Disconnected!");
+				sensor_connected = false;
+				//WHY the stream ended decides the PLC fault bit + whether to reconnect:
+				//  - tmini_data_stream_flag still TRUE  -> a runtime stall/error (disconnect):
+				//    latch fault and wake the control thread to reconnect (fresh retry cycle).
+				//  - tmini_data_stream_flag now FALSE   -> a clean disable (process off): no fault.
+				if (tmini_data_stream_flag)
+				{
+					sensor_fault = true;
+					reconnect_attempts = 0;						//fresh reconnect cycle
+					sensor_last_attempted_time = std::chrono::system_clock::now() - std::chrono::milliseconds(connect_timeout + 1);
+					logMessage("Sensor stream fault -> reconnecting...");
+					{
+						std::unique_lock<std::mutex> lock(mutex_tmini_ctrl);
+						tmini_ctrl_flag = true;					//wake tmini control thread to reconnect
+					}
+					cond_tmini_ctrl.notify_one();
+				}
+				else
+				{
+					sensor_fault = false;						//clean disable
+					logMessage("Sensor Disconnected (process disabled).");
+				}
 			}
 		}
 	}
@@ -8764,8 +8853,8 @@ bool deviation_output_pca(bool isFrontSensor, bool Target_on_Right, bool isMount
 		if (hole_pos.x != -10000 && cone_pos.x != -10000)
 		{
 			//based on TUAS-3DSP.
-			int x_offset = 14;
-			int z_offset = 26;
+			int x_offset = 26;	//X (Gantry) legacy hole-edge offset
+			int z_offset = 14;	//Z (Trolley) legacy hole-edge offset
 
 			//Hole - Cone
 			if (!Target_on_Right) devOut_pca_x = cone_pos.x - (hole_pos.x - x_offset);
@@ -8856,8 +8945,8 @@ bool deviation_output_pca(bool isFrontSensor, bool Target_on_Right, bool isMount
 		else if (hole_pos.x != -10000 && guide_pos.x != -10000)
 		{
 			//based on TUAS-3DSP.
-			int x_offset = 14;
-			int z_offset = 26;
+			int x_offset = 26;	//X (Gantry) legacy hole-edge offset
+			int z_offset = 14;	//Z (Trolley) legacy hole-edge offset
 
 			//Hole - Cone
 			if (!Target_on_Right) devOut_pca_x = cone_pos.x - (hole_pos.x - x_offset);
@@ -9014,26 +9103,18 @@ void fillRoiParams(const JobInfo& jobInfo, ChassisRoiParams& roiPrm)
 	}
 	else if (jobInfo.chassisType == "IGH")
 	{
-		//IGH crop is SEPARATE from XT -- own X/Y/Z, NOT the shared HEIGHT_MMR/TROLLEY_MMR or the
-		//colliding IGH_4XF RNG key. Sized from the GT spread (roi_igh_eval / igh_spread analysis):
-		//the CS(REAR) guides span Z~1222..1842 and X wide (merged ~480mm), larger than XT's fixed
-		//window. TODO: lift these to dedicated IGH INI keys.
-		roiPrm.yMin = -600.f; roiPrm.yMax = 100.f;			//Y (Height): guide + targets (up to ~56)
-		if (CURRENT_SENSOR_POSITION == "FRONT")				//FS sensor
-		{
-			roiPrm.xMin = 500.f;  roiPrm.xMax = 1150.f;		//X (Gantry): GT 796..927 + margin
-			roiPrm.zMin = 1400.f; roiPrm.zMax = 2050.f;		//Z (Trolley): GT 1521..1776 + margin
-			roiPrm.coneY = (jobInfo.chassisLen == 45) ? -7.f : -4.f;	//guide TOP height
-		}
-		else												//CS sensor (REAR app, Center)
-		{
-			roiPrm.xMin = 350.f;  roiPrm.xMax = 1300.f;		//X: GT 512..1035 (merged whole)
-			roiPrm.zMin = 1150.f; roiPrm.zMax = 2050.f;		//Z: GT 1222..1842 (near-Z front included)
-			roiPrm.coneY = (jobInfo.chassisLen == 45) ? -66.f : -77.f;
-			//MERGED long guide (CHS40, ~480mm): widen the region xspan so the WHOLE guide is
-			//passed on (default 300mm crops both ends). cx is already the merged centre.
-			if (jobInfo.chassisLen == 40) roiPrm.xspan = 600.f;
-		}
+		//IGH crop is SEPARATE from XT -- own X/Y/Z + guide-top coneY + merged-vs-single xspan,
+		//per sensor AND CHS length (the shared preset key lumps Big CHS40/45, so IGH gets its
+		//own per-length boxes). Values come from process.ini PRESET_*_3D IGH_ROI_40/45; when
+		//those keys are absent the struct defaults reproduce the offline-validated hardcode.
+		const PRESET_POS::IGH_ROI_BOX& b = (CURRENT_SENSOR_POSITION == "FRONT")
+			? (jobInfo.chassisLen == 45 ? presetPos.F_IGH_ROI_45 : presetPos.F_IGH_ROI_40)
+			: (jobInfo.chassisLen == 45 ? presetPos.R_IGH_ROI_45 : presetPos.R_IGH_ROI_40);
+		roiPrm.xMin = b.xMin; roiPrm.xMax = b.xMax;
+		roiPrm.yMin = b.yMin; roiPrm.yMax = b.yMax;
+		roiPrm.zMin = b.zMin; roiPrm.zMax = b.zMax;
+		roiPrm.coneY = b.coneY;
+		roiPrm.xspan = b.xspan;
 	}
 
 	//WIDE CROP override -- close-range XT Center 40chs/20job (F app -> Center sensor, 20F).
@@ -9074,6 +9155,50 @@ pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 	return nc;
 }
 
+//XT 2-cone (40ft center: TWO 20ft twist-lock cones ~430mm apart in X). The single-cone corner
+//detector picks the WRONG cone here, so the target END is chosen EXPLICITLY by job:
+//targetMaxX(Big) -> max-X cone, else(Small) -> min-X cone. target.X = that outer X extreme
+//INSET inward by `inset` (~cone half-width = the corner); Z = near-Z front; Y = corner height.
+//GT-validated (median |dX/dZ| ~7/9mm). Mirrors the tools/ Python end-selection prototype.
+pcl::PointXYZ xt_center_end_target(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool targetMaxX, float inset)
+{
+	pcl::PointXYZ inv(-10000.f, -10000.f, -10000.f);
+	if (!region || (int)region->points.size() < 30) return inv;
+	auto clean = chassis_roi_sor(region);
+	if ((int)clean->points.size() < 30) clean = region;
+	//NEAR-Z TIPS over a WIDE near-Z band. The two cones can sit ~90mm apart in Z (esp. REAR:
+	//the min-X cone is nearer, the max-X cone deeper). A thin near-face (80mm) drops the deeper
+	//cone, so the X extreme lands on the wrong cone. Use a robust near-Z band (3rd-pct Z + 150mm)
+	//+ upper-half height so BOTH cones are candidates for the max/min-X extreme.
+	std::vector<float> allz, ally;
+	allz.reserve(clean->points.size()); ally.reserve(clean->points.size());
+	for (const auto& p : clean->points) { allz.push_back(p.z); ally.push_back(p.y); }
+	std::sort(allz.begin(), allz.end()); std::sort(ally.begin(), ally.end());
+	float zNear = allz[(int)(allz.size() * 0.03f)];
+	float yMid  = ally[(int)(ally.size() * 0.55f)];
+	std::vector<const pcl::PointXYZ*> tips;
+	for (const auto& p : clean->points)
+		if (p.z <= zNear + 150.f && p.y >= yMid) tips.push_back(&p);
+	if ((int)tips.size() < 15) return inv;
+	//outer X extreme of the near-Z tips = the target END cone of the two-cone span
+	float xExt = targetMaxX ? -1e9f : 1e9f;
+	for (auto* p : tips) xExt = targetMaxX ? std::max(xExt, p->x) : std::min(xExt, p->x);
+	float tx = targetMaxX ? (xExt - inset) : (xExt + inset);
+	//end-cone slab (within 230mm of the extreme): Z 20th-pct = near-Z front.
+	std::vector<float> zs;
+	for (auto* p : tips)
+		if (std::fabs(p->x - xExt) <= 230.f) zs.push_back(p->z);
+	if ((int)zs.size() < 8) return inv;
+	std::sort(zs.begin(), zs.end());
+	float tz = zs[(int)(zs.size() * 0.2f)];
+	//Height = LOCAL plate-corner height at (tx,tz): median Y within 60mm over the FULL crop.
+	//The upper-half tips sit at the cone TOP (~250mm above the plate the XT target needs), so
+	//the plate must be read locally, not from the tip median.
+	float ty = chassis_roi_corner_height(clean, tx, tz, 60.f);
+	if (ty == -10000.f) return inv;
+	return pcl::PointXYZ(tx, ty, tz);
+}
+
 //Localize the chassis cone from the preset ROI (VA-independent), returning a WORLD point
 //(-10000 sentinel on failure). Self-contained: does NOT touch the VA _pcCone/_cone_pos.
 //XT uses the near-Z-face refinement (same chain as FORCE_ROI); IGH uses pc_IGH_detection.
@@ -9095,15 +9220,27 @@ pcl::PointXYZ computeRoiConePos(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, 
 		}
 		else //XT
 		{
-			auto clean = chassis_roi_sor(region);
-			auto face = chassis_roi_near_face(clean, 80.f);
-			pcl::PointXYZ nc = pc_cone_detection_naive(face, target_on_right, "");
-			if (nc.x != -10000.f)
+			//2-cone (40ft center): the crop holds TWO cones; pick the END explicitly by job
+			//(Big->max-X, Small->min-X). The shared corner detector would grab the wrong cone
+			//for Small. Single-cone configs keep the detector.
+			bool ctc = (jobInfo.chassisLen == 40 && current_lane_camera.find("CS") != std::string::npos);
+			if (ctc)
 			{
-				chassis_roi_sparse_edge_rescue(face, target_on_right, nc);
-				float ch = chassis_roi_corner_height(face, nc.x, nc.z);
-				if (ch != -10000.f) nc.y = ch;
-				result = nc;
+				//run on the FULL crop (both cones); `region` was narrowed to a single cone.
+				result = xt_center_end_target(crop, (jobInfo.jobPos == "Big"), (float)XT_TWOCONE_INSET);
+			}
+			else
+			{
+				auto clean = chassis_roi_sor(region);
+				auto face = chassis_roi_near_face(clean, 80.f);
+				pcl::PointXYZ nc = pc_cone_detection_naive(face, target_on_right, "");
+				if (nc.x != -10000.f)
+				{
+					chassis_roi_sparse_edge_rescue(face, target_on_right, nc);
+					float ch = chassis_roi_corner_height(face, nc.x, nc.z);
+					if (ch != -10000.f) nc.y = ch;
+					result = nc;
+				}
 			}
 		}
 	}
@@ -9123,8 +9260,17 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	else if (current_lane_camera.find("RS") != std::string::npos)
 		cam_pos = "Rear";
 
+	//SPRD40 never uses the center sensor -> every Center job is SPRD20. A 40ft XT chassis then
+	//shows TWO 20ft twist-lock cones in the center view. But when VA is VALID it already picks the
+	//SINGLE target cone -> use normal target_on_right (Big->right/max-X, Small->left/min-X), same
+	//as before. Only when VA cannot catch BOTH cones (vaInRange gate below: coneCount<2 -> can't
+	//tell front from rear) do we fall to the ROI 2-cone END-selection. So target_on_right is NOT
+	//bypassed here; the 2-cone path is a ROI fallback, and the END direction == target_on_right.
+	bool centerTwoCone = (cam_pos == "Center" && jobInfo.chassisLen == 40 && jobInfo.chassisType == "XT");
 	bool target_on_right = (cam_pos == "Center" && (jobInfo.jobPos == "Big" || jobInfo.chassisLen == 20));
-	logMessage("Target on right: " + std::to_string(target_on_right) + " , job pos:" + jobInfo.jobPos + " , ChassisLen:" + std::to_string(jobInfo.chassisLen));
+	bool targetMaxX = target_on_right;	//2-cone END direction (Big->max-X) == target_on_right
+	logMessage("Target on right: " + std::to_string(target_on_right) + " twoCone:" + std::to_string(centerTwoCone)
+		+ " , job pos:" + jobInfo.jobPos + " , ChassisLen:" + std::to_string(jobInfo.chassisLen));
 
 	cv::Mat res_image = image.clone();
 
@@ -9230,9 +9376,12 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		deviation_output_va(isFrontSensor, cam_pos, _detected_chassis_type, _target_hole, _target_cone, _target_guide, ref(_cntrX), ref(_cntrY), ref(_cntrProb), ref(_coneX), ref(_coneY), ref(_coneProb), ref(_dvOutX), ref(_dvOutY), ref(_dvOutX_mm), ref(_dvOutY_mm), jobLog);
 
 #pragma region landout detection
+		//Landout gate = _eff_landed (RELIABLE PLC SPRD_Landed bit in live; visual trigger only in
+		//debug/batch). 2026-07-14: was _sprd_landed_trigger (visual even in live) -- visual class
+		//flap reset the landout debounce. Now consistent with the CLPS gate below.
 		if (jobInfo.isMountCycle)
 		{
-			_landout_detected = landOut_detected_va(jobInfo.isMountCycle, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _sprd_landed_trigger, _detected_hole, ref(devOut_LDO_x), ref(devOut_LDO_y));
+			_landout_detected = landOut_detected_va(jobInfo.isMountCycle, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _eff_landed, _detected_hole, ref(devOut_LDO_x), ref(devOut_LDO_y));
 		}
 #pragma endregion
 
@@ -9441,7 +9590,12 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		if (jobInfo.isMountCycle)
 		{
 			bool vaPresent = (!usePreset && _target_cone.prob > 0 && _cone_pos.x != -10000.f);
-			bool vaInRange = vaPresent
+			//2-cone (XT 40ft center): VA must have caught BOTH cones. With only one detected we
+			//cannot tell the front cone from the rear, so drop to the ROI end-selection (site owner).
+			//cones = cone(idx1) + land(idx2).
+			bool va2ConeOk = !centerTwoCone
+				|| ((int)(det_sorted_objects[1].size() + det_sorted_objects[2].size()) >= 2);
+			bool vaInRange = vaPresent && va2ConeOk
 				&& _cone_pos.x >= (float)jobInfo.presetRangeX.MIN
 				&& _cone_pos.x <= (float)jobInfo.presetRangeX.MAX;
 
@@ -9545,14 +9699,30 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			//inflates max-Y and pushes the upper-half mid-Y up (shaving the plate).
 			auto _roiClean = chassis_roi_sor(_pcCone);
 			auto _roiFace = chassis_roi_near_face(_roiClean, 80.f);
-			pcl::PointXYZ nc = pc_cone_detection_naive(_roiFace, target_on_right, "");
+			//2-cone (40ft center): pick the END cone explicitly (Big->max-X / Small->min-X). Run on
+			//a FULL preset crop (BOTH cones) re-made from roiPrm -- _pcCone was narrowed by
+			//extract_region to a single (near/min-X) cone, so the max-X (Big) target could never be
+			//reached from it. Single-cone configs keep the face detector.
+			pcl::PointXYZ nc(-10000.f, -10000.f, -10000.f);
+			if (centerTwoCone)
+			{
+				auto _tcCrop = chassis_roi_crop(pointCloud, roiPrm.xMin, roiPrm.xMax, roiPrm.yMin, roiPrm.yMax, roiPrm.zMin, roiPrm.zMax, "", "");
+				nc = xt_center_end_target(_tcCrop, targetMaxX, (float)XT_TWOCONE_INSET);
+			}
+			else
+			{
+				nc = pc_cone_detection_naive(_roiFace, target_on_right, "");
+			}
 			if (nc.x != -10000.f)
 			{
-				//Sparse-face rescue: on thin faces the detector's dense X stage stops short
-				//of the true edge column -- conditionally move the corner there (x,z only).
-				chassis_roi_sparse_edge_rescue(_roiFace, target_on_right, nc);
-				float ch = chassis_roi_corner_height(_roiFace, nc.x, nc.z);
-				if (ch != -10000.f) nc.y = ch;
+				if (!centerTwoCone)
+				{
+					//Sparse-face rescue: on thin faces the detector's dense X stage stops short
+					//of the true edge column -- conditionally move the corner there (x,z only).
+					chassis_roi_sparse_edge_rescue(_roiFace, target_on_right, nc);
+					float ch = chassis_roi_corner_height(_roiFace, nc.x, nc.z);
+					if (ch != -10000.f) nc.y = ch;
+				}
 				_cone_pos = nc;
 
 				//Debug artifacts (batch): the face fed to the detector + the NEW target point.
@@ -9653,11 +9823,16 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	}
 #pragma endregion
 
-	//Landout final output: VA ONLY for now (PCA landout intentionally NOT combined into the
-	//output -- _landout_detected_pca still computed & logged for diagnostics, just not sent).
-	_Out_landout_detected = _landout_detected;	//was: (_landout_detected || _landout_detected_pca)
-	_Out_clps_detected = (_clps_detected || _clps_detected_pca || _clps_3d);
-	_Out_clps_ok_detected = (_clps_ok_detected || _clps_ok_detected_pca || _clps_ok_3d);
+	//2026-07-14: final PLC output (byte17) = VA ONLY, all chassis. The PCA (deviation_output_pca)
+	//and 3D (ClpsOffload3D) paths above still RUN -- their verdicts stay in the res.txt / log
+	//columns (CLPS_3D/CLPSOK_3D/landout_pca/clps_pca/...) and in the PCA diagnostic byte30 -- but
+	//they are NOT OR-combined into byte17 until the 3D CLPS path is validated against real offload
+	//separation recordings (still absent). Re-enable by restoring the ORs:
+	//  _Out_clps_detected    = (_clps_detected    || _clps_detected_pca    || _clps_3d);
+	//  _Out_clps_ok_detected = (_clps_ok_detected || _clps_ok_detected_pca || _clps_ok_3d);
+	_Out_landout_detected = _landout_detected;	//already VA-only (PCA landout never combined)
+	_Out_clps_detected = _clps_detected;
+	_Out_clps_ok_detected = _clps_ok_detected;
 
 #pragma region 3D deviation OUTPUT multiplex (XT/IGH) -- position vs deviation
 	//What we SEND to the PLC on Dev_*_3D is phase-multiplexed. Detection above still ran
@@ -9674,7 +9849,11 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	bool _dev3d_is_position = false;
 	if (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
 	{
-		const int x_offset = 14, z_offset = 26;						//legacy TUAS-3DSP offsets
+		const int x_offset = 26, z_offset = 14;						//legacy TUAS-3DSP offsets (X=26, Z=14)
+		//2-cone deviation (167 hole-align) applies ONLY when the cone came from the ROI END-selection
+		//(FORCE_ROI always uses ROI; production only when VA failed to catch both cones -> _coneSrc==3).
+		//A VALID VA single cone uses the normal single-cone deviation below.
+		bool coneFromRoiEnd = centerTwoCone && (FORCE_ROI_MODE || _coneSrc == 3);
 		//Chassis reference: position_detection_pca writes BOTH XT (idx1) and IGH (idx3) into
 		//_cone_pos (only CST uses _guide_pos, which is out of scope here). So _cone_pos for both.
 		pcl::PointXYZ chRef = _cone_pos;
@@ -9689,7 +9868,19 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		{
 			if (finite3(_hole_pos) && finite3(c))
 			{
-				_dev3d_out_x = (int)(c.x - (target_on_right ? (_hole_pos.x + x_offset) : (_hole_pos.x - x_offset)));
+				if (coneFromRoiEnd)
+				{
+					//2-cone ROI end cone: cone target = the END corner (Big->max-X / Small->min-X).
+					//The corner-casting WIDTH (167) shifts the HOLE to that same endpoint (Big +,
+					//Small -); the legacy edge offset (26) is applied to the CONE (Big +26, Small -26).
+					float coneX = targetMaxX ? (c.x + x_offset) : (c.x - x_offset);
+					float holeX = targetMaxX ? (_hole_pos.x + CORNER_CASTING_W) : (_hole_pos.x - CORNER_CASTING_W);
+					_dev3d_out_x = (int)(coneX - holeX);
+				}
+				else
+				{
+					_dev3d_out_x = (int)(c.x - (target_on_right ? (_hole_pos.x + x_offset) : (_hole_pos.x - x_offset)));
+				}
 				_dev3d_out_y = (int)(c.y - _hole_pos.y);
 				_dev3d_out_z = (int)(c.z - (_hole_pos.z + z_offset));
 			}
@@ -9734,6 +9925,15 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	}
 #pragma endregion
 
+	//RS (rear) sensor sits on the OPPOSITE side from FS/CS -> its 3D DEVIATION is mirrored in X
+	//and Z. Deviation only: positions (_dev3d_is_position) stay as-is. XT/IGH only (the block
+	//above computes _dev3d_out for those).
+	if ((_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
+		&& cam_pos == "Rear" && !_dev3d_is_position)
+	{
+		if (_dev3d_out_x != -10000) _dev3d_out_x = -_dev3d_out_x;
+		if (_dev3d_out_z != -10000) _dev3d_out_z = -_dev3d_out_z;
+	}
 
 	logLines += std::to_string(_pcHole->points.size()) + ";" + std::to_string(_pcCone->points.size()) + ";" + std::to_string(_pcGuide->points.size()) + ";";
 	logLines += std::to_string(_hole_pos.x) + ";" + std::to_string(_hole_pos.y) + ";" + std::to_string(_hole_pos.z) + ";";
