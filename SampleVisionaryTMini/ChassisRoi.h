@@ -76,6 +76,13 @@ struct ChassisRoiParams
 					//Required: the CHS20 wheel is nearer-Z than the cone, so a
 					//runtime nearest-Z estimate would lock onto the wheel. -10000
 					//= unset -> falls back to a (less reliable) runtime estimate.
+	bool  guideDenseY = false;	//IGH: centre candBand on the DOMINANT dense-Y mass (the guide)
+					//instead of coneY. The twist-lock cone/post sits ~250mm ABOVE the
+					//guide and is nearer-Z, so coneY / near-Z centring targets the WRONG
+					//(upper) structure; the guide is the largest mass in the crop.
+	float guideDenseWin = 120.f;	//height window (mm) for the dominant-mass search
+	float guideDeckGuard = 150.f;	//exclude points within this of the crop floor (min-Y): a deck/
+					//funnel-bottom mass can out-density the guide and pull the band down.
 	float candYband   = 140.f;	//candidate cone-height band (drops the low handle/rail)
 	float colXbin     = 40.f;	//lateral bin width for per-column near-Z
 	float protrudeTol = 100.f;	//a column is "cone" if nearZ <= globalMin+this
@@ -91,6 +98,12 @@ struct ChassisRoiParams
 	float yBinw       = 30.f;	//height histogram bin
 	float yReachDown  = 230.f;	//height cluster reach below cy (plate + below)
 	float yReachUp    = 130.f;	//height cluster reach above cy (cone top)
+	float guideReachUp = 130.f;	//IGH ONLY (guideDenseY): reach UP above the dense guide centre.
+					//SENSOR-SPECIFIC (set in fillRoiParams): FRONT=240 -- the guide top-left
+					//corner sits ~200mm above cy AND the twist-lock POST is OCCLUDED, so the
+					//XT-sized 130 CLIPS the corner (~80mm H under-read) and extending is safe.
+					//REAR=130 (default) -- the corner is only ~100mm up but the POST is VISIBLE
+					//and continuous, so a larger reach climbs the post to the cone (+180mm).
 	float yBelow      = 100.f;	//keep this far under the plate (capped at wheel)
 	float yMaxGap     = 45.f;	//height cluster gap-hop
 	float yPeakFrac   = 0.2f;	//height occupancy threshold = frac * cone-region peak
@@ -211,6 +224,34 @@ namespace chassis_roi_detail
 		return n > 0 ? (float)(sy / n) : 0.f;
 	}
 
+	//Y centre of the DENSEST `win`-mm height window = the dominant structure. For IGH the
+	//GUIDE is the largest mass; the twist-lock cone/post above it (nearer-Z, smaller) would
+	//be picked by coneY / near-Z centring. Sliding-window max-count over sorted Y.
+	inline float dominantDenseY(const pcl::PointCloud<pcl::PointXYZ>::Ptr& c, float win, float deckGuard = 0.f)
+	{
+		std::vector<float> ys; ys.reserve(c->points.size());
+		for (const auto& p : c->points) ys.push_back(p.y);
+		if (ys.empty()) return 0.f;
+		std::sort(ys.begin(), ys.end());
+		//Drop the deck floor: a flat deck / funnel-bottom near the crop's min-Y can be DENSER
+		//than the guide and would win the dominant-mass search, pulling the band ~300mm too low
+		//(seen on FRONT CHS45 Big). Exclude points within deckGuard of min-Y (keep if enough
+		//remain) so the guide wins.
+		if (deckGuard > 0.f)
+		{
+			float floorY = ys.front() + deckGuard;
+			size_t k = 0; while (k < ys.size() && ys[k] < floorY) k++;
+			if ((int)(ys.size() - k) >= 30) ys.erase(ys.begin(), ys.begin() + (long)k);
+		}
+		int n = (int)ys.size(), lo = 0, bestN = 0; float bestC = ys[0];
+		for (int hi = 0; hi < n; hi++)
+		{
+			while (ys[hi] - ys[lo] > win) lo++;
+			if (hi - lo + 1 > bestN) { bestN = hi - lo + 1; bestC = 0.5f * (ys[lo] + ys[hi]); }
+		}
+		return bestC;
+	}
+
 	//Per-lateral-column near-Z protrusion -> one candidate cloud per cone. Each
 	//column keeps its OWN near-Z so a deeper target isn't lost behind a nearer
 	//partner; deck between cones (farther Z) drops out, splitting them.
@@ -298,6 +339,9 @@ namespace chassis_roi_detail
 	//of the CONE REGION only, so the wheel's huge density can't drop the plate.
 	inline void conePlateYBand(std::vector<float> yv, float cy, const ChassisRoiParams& prm, float& ylo, float& yhi)
 	{
+		//IGH guide is taller than the XT cone -> reach further UP so the guide top-left corner
+		//(the target) is not clipped (#2 FRONT ~80mm H under-read). XT keeps yReachUp.
+		const float reachUp = prm.guideDenseY ? prm.guideReachUp : prm.yReachUp;
 		if ((int)yv.size() < prm.yMinAbs) { ylo = yv.empty() ? cy : *std::min_element(yv.begin(), yv.end()); yhi = yv.empty() ? cy : *std::max_element(yv.begin(), yv.end()); return; }
 		float ymin = *std::min_element(yv.begin(), yv.end()), ymax = *std::max_element(yv.begin(), yv.end());
 		float lo = std::floor(ymin / prm.yBinw) * prm.yBinw, hi = std::ceil(ymax / prm.yBinw) * prm.yBinw;
@@ -307,7 +351,7 @@ namespace chassis_roi_detail
 		int hmaxAll = 0; for (int x : h) hmaxAll = std::max(hmaxAll, x);
 		if (hmaxAll == 0) { ylo = ymin; yhi = ymax; return; }
 		int localPeak = 0;
-		for (int i = 0; i < nb; i++) { float bc = lo + i * prm.yBinw; if (bc >= cy - prm.yReachDown && bc <= cy + prm.yReachUp) localPeak = std::max(localPeak, h[i]); }
+		for (int i = 0; i < nb; i++) { float bc = lo + i * prm.yBinw; if (bc >= cy - prm.yReachDown && bc <= cy + reachUp) localPeak = std::max(localPeak, h[i]); }
 		if (localPeak == 0) localPeak = hmaxAll;
 		float thr = std::max((float)prm.yMinAbs, prm.yPeakFrac * localPeak);
 		std::vector<bool> occ(nb, false); bool any = false;
@@ -319,8 +363,8 @@ namespace chassis_roi_detail
 		int loI = ci;
 		while (true) { int nxt = -1; for (int j = loI - 1; j >= std::max(0, loI - ghop); j--) if (occ[j]) { nxt = j; break; } if (nxt < 0 || lo + nxt * prm.yBinw < cy - prm.yReachDown) break; loI = nxt; }
 		int hiI = ci;
-		while (true) { int nxt = -1; for (int j = hiI + 1; j <= std::min(nb - 1, hiI + ghop); j++) if (occ[j]) { nxt = j; break; } if (nxt < 0 || lo + nxt * prm.yBinw > cy + prm.yReachUp) break; hiI = nxt; }
-		yhi = std::min(lo + (hiI + 1) * prm.yBinw, cy + prm.yReachUp);
+		while (true) { int nxt = -1; for (int j = hiI + 1; j <= std::min(nb - 1, hiI + ghop); j++) if (occ[j]) { nxt = j; break; } if (nxt < 0 || lo + nxt * prm.yBinw > cy + reachUp) break; hiI = nxt; }
+		yhi = std::min(lo + (hiI + 1) * prm.yBinw, cy + reachUp);
 		float plate = lo + loI * prm.yBinw;
 		float wfloor = -1e9f;
 		for (int j = loI - 1; j >= 0; j--) if (occ[j]) { wfloor = lo + (j + 1) * prm.yBinw; break; }
@@ -347,14 +391,38 @@ inline pcl::PointCloud<pcl::PointXYZ>::Ptr chassis_roi_extract_region(
 	//1. cone height (PER-CONFIG preset; runtime estimate only as a fallback) + tight
 	//   candidate band (drops the low handle/rail; on CHS20 the wheel is nearer-Z).
 	float cy = (prm.coneY > -9000.f) ? prm.coneY : chassis_roi_detail::coneHeightEstimate(crop, prm);
-	Cloud::Ptr candBand(new Cloud);
-	for (const auto& p : crop->points)
-		if (p.y >= cy - prm.candYband && p.y <= cy + prm.candYband) candBand->points.push_back(p);
-	if ((int)candBand->points.size() < prm.minConePts) return empty;
+	//IGH: the GUIDE (target) is the dominant dense-Y mass; the twist-lock cone/post ~250mm
+	//ABOVE it is nearer-Z, so preset-coneY / near-Z centring latches onto the WRONG (upper)
+	//structure (target Y ~+60 instead of the guide top ~-170). Centre on the dominant mass.
+	if (prm.guideDenseY)
+		cy = chassis_roi_detail::dominantDenseY(crop, prm.guideDenseWin, prm.guideDeckGuard);
+	auto buildCandBand = [&](float cyc) {
+		Cloud::Ptr cb(new Cloud);
+		for (const auto& p : crop->points)
+			if (p.y >= cyc - prm.candYband && p.y <= cyc + prm.candYband) cb->points.push_back(p);
+		return cb;
+	};
+	Cloud::Ptr candBand = buildCandBand(cy);
 
 	//2. per-column near-Z candidates + side-rule selection
 	auto cands = chassis_roi_detail::coneColumns(candBand, prm);
-	if (cands.empty()) return empty;
+	//A GUIDE-ONLY IGH (ighs, no twist-lock cone poking up) can have its guide top well
+	//BELOW the preset coneY -- e.g. REAR CHS45, guide mass ~-375 vs preset -66 -- so the
+	//preset-centred band grabs only empty space above the guide and coneColumns starves.
+	//Re-centre ONCE on the crop's near-Z structure height (in the now-correct trolley crop
+	//the guide IS the nearest-Z mass) and retry. Preset stays authoritative wherever it
+	//already forms columns, so the CHS20-wheel case (dense preset band) never triggers this.
+	if (cands.empty() && prm.coneY > -9000.f && !prm.guideDenseY)
+	{
+		float cyEst = chassis_roi_detail::coneHeightEstimate(crop, prm);
+		if (std::fabs(cyEst - cy) > prm.candYband * 0.5f)
+		{
+			cy = cyEst;
+			candBand = buildCandBand(cy);
+			cands = chassis_roi_detail::coneColumns(candBand, prm);
+		}
+	}
+	if ((int)candBand->points.size() < prm.minConePts || cands.empty()) return empty;
 	auto xmean = [](const Cloud::Ptr& c) { double s = 0; for (const auto& p : c->points) s += p.x; return c->points.empty() ? 0.0 : s / c->points.size(); };
 	Cloud::Ptr target = cands[0]; double bestX = xmean(cands[0]);
 	for (auto& c : cands) { double m = xmean(c); if (targetOnRight ? (m > bestX) : (m < bestX)) { bestX = m; target = c; } }
