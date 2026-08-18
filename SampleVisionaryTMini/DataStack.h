@@ -81,7 +81,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
 
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(image, pointcloud, ts);
+                            d_tuple1 = std::make_tuple(stack_image, pointcloud, ts);	//store the CLONE (already computed) so the stack owns its own image buffer (no sharing with grayToClr -> saved original stays box-free)
 
                             isUsed1 = false;
                             isUpdated1 = true;
@@ -130,7 +130,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
 
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(image, pointcloud, ts);
+                            d_tuple2 = std::make_tuple(stack_image, pointcloud, ts);	//store the CLONE (already computed) so the stack owns its own image buffer (no sharing with grayToClr -> saved original stays box-free)
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -182,7 +182,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
 
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(image, pointcloud, ts);
+                            d_tuple2 = std::make_tuple(stack_image, pointcloud, ts);	//store the CLONE (already computed) so the stack owns its own image buffer (no sharing with grayToClr -> saved original stays box-free)
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -231,7 +231,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
 
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(image, pointcloud, ts);
+                            d_tuple1 = std::make_tuple(stack_image, pointcloud, ts);	//store the CLONE (already computed) so the stack owns its own image buffer (no sharing with grayToClr -> saved original stays box-free)
 
                             isUsed1 = false;
                             isUpdated1 = true;

@@ -156,7 +156,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.4";
+const std::string program_version = "1.6";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -517,6 +517,11 @@ std::string DEBUG_SENSOR_POSITION = "FRONT";
 bool DEBUG_BATCH_JOB = false;
 std::string DEBUG_BATCH_ROOT_DIR = "";
 std::string DEBUG_BATCH_SAVE_DIR = "";
+//Image-only VA (2D) inference test: run the detector over a folder of .jpg (NO depth),
+//save annotated result images + a per-image detection CSV. For validating a new model.
+bool IMAGE_ONLY_TEST = false;
+std::string IMAGE_ONLY_DIR = "";
+std::string IMAGE_ONLY_SAVE_DIR = "";
 //Reverse-replay: process Mount jobs BACKWARDS and treat them as OFFLOAD jobs.
 //A mount recording played in reverse is an offload (landed -> hoist -> separation ->
 //cone-only) -- the only sequence data containing the separation phase, since real
@@ -529,12 +534,18 @@ bool DEBUG_CONVERT_PCL_RANGE = false;
 bool ENALBE_RESTART_APPLICATION = false;
 bool ENABLE_SAVE_LOG_BIT = false;
 bool ENABLE_PRESET_VISUAL_ON_STREAM = false;
+bool ENABLE_VA_VISUAL_ON_STREAM = false;	//overlay the latest VA target boxes on the live stream
 bool ENABLE_IMAGE_LOGGING_ONLY = false;
 
 std::string CURRENT_SENSOR_POSITION = "FRONT";
 bool DIRECTION_FRONT_IS_RIGHT = true; //current sample. TODO: need to read from INI.
 
 int PROB_LIMIT = 50;
+
+//Per-frame / per-stage tracing (process.ini [SYSTEM] ENABLE_STAGE_LOG). Default ON. When a hang
+//recurs, the LAST "[STAGE]" line in the log tells us exactly which frame/stage wedged (frame START
+//with no matching done = ProcessLogic stalled; frames stop entirely = sensor stream stall).
+bool ENABLE_STAGE_LOG = true;
 
 std::string onnx_model_path;
 
@@ -662,6 +673,20 @@ bool sensor_connected = false, sensor_fault = false;
 int MAX_RECONNECT_ATTEMPTS = 10;
 int STREAM_FRAME_TIMEOUT = 2000;
 int reconnect_attempts = 0;			//consecutive failed setups in the current reconnect cycle
+
+//Stream watchdog (process.ini [SETTINGS], optional). A blocking getNextFrame() can wedge the
+//data-stream thread forever on a camera/network stall (no socket timeout) -> the in-loop
+//STREAM_FRAME_TIMEOUT check never runs because the grab never returns. A SEPARATE watchdog thread
+//detects "no new frame for WATCHDOG_NOFRAME_MS while streaming", closes the stream (public
+//dataStream.close()) to unblock the grab -> the existing reconnect re-opens; after
+//WATCHDOG_MAX_RECOVER unsuccessful windows it force-terminates so the PM manager restarts the app.
+//SICK lib is NOT modified -- only the public close() is called.
+int WATCHDOG_NOFRAME_MS = 5000;
+int WATCHDOG_MAX_RECOVER = 3;
+std::atomic<long long> g_lastFrameMs{ 0 };	//atomic mirror of last_frame_get_time (ms since epoch)
+std::atomic<int> g_watchdogRecover{ 0 };
+std::atomic<bool> watchdog_running{ true };
+
 bool enabled_stream = false, enabled_process = false, enabled_logging = false;
 
 short Detected_Chs_X_VA = 0, Detected_Chs_Y_VA = 0, Detected_Chs_Prob = 0;
@@ -731,6 +756,11 @@ int clps_ok_detected_pca_only_count = 0;
 
 JobInfo current_job_info;
 ProcessResults current_process_results;
+//Latest VA target boxes shared processingThread -> data-stream display for live overlay.
+//The display stays real-time; these boxes lag by ~1 inference cycle (expected).
+std::mutex g_vaOverlayMutex;
+bbx g_vaOverlayChassis;
+bbx g_vaOverlayContainer;
 
 bool Logging_Enable = false;
 bool Front_Logging = false;
@@ -1396,7 +1426,12 @@ auto parseINI(string path) -> bool
 		ENABLE_SAVE_LOG_BIT = inidata.get("SYSTEM").get("ENABLE_SAVE_LOG_BIT") == "1" ? true : false;
 		ENALBE_RESTART_APPLICATION = inidata.get("SYSTEM").get("ENABLE_RESTART_APPLICATION") == "1" ? true : false;
 		ENABLE_PRESET_VISUAL_ON_STREAM = inidata.get("SYSTEM").get("ENABLE_PRESET_VISUAL_ON_STREAM") == "1" ? true : false;
+		if (inidata.get("SYSTEM").has("ENABLE_VA_VISUAL_ON_STREAM"))
+			ENABLE_VA_VISUAL_ON_STREAM = inidata.get("SYSTEM").get("ENABLE_VA_VISUAL_ON_STREAM") == "1";
 		ENABLE_IMAGE_LOGGING_ONLY = inidata.get("SYSTEM").get("ENABLE_IMAGE_LOGGING_ONLY") == "1" ? true : false;
+		//Per-frame/stage tracing -- DEFAULT ON; set [SYSTEM] ENABLE_STAGE_LOG=0 to silence.
+		if (inidata.get("SYSTEM").has("ENABLE_STAGE_LOG"))
+			ENABLE_STAGE_LOG = inidata.get("SYSTEM").get("ENABLE_STAGE_LOG") == "1" ? true : false;
 
 		onnx_model_path = inidata.get("MODEL").get("ONNX_PATH");
 		logMessage("onnx model path: " + onnx_model_path);
@@ -1423,6 +1458,15 @@ auto parseINI(string path) -> bool
 		if (inidata.get("DEBUG").has("ENABLE_MOUNT_REVERSE"))
 			ENABLE_MOUNT_REVERSE = inidata.get("DEBUG").get("ENABLE_MOUNT_REVERSE") == "1";
 		if (ENABLE_MOUNT_REVERSE) logMessage("[DEBUG] ENABLE_MOUNT_REVERSE: Mount jobs will be replayed BACKWARDS as OFFLOAD");
+
+		//Optional: image-only VA inference test (2D detector over a folder of .jpg, no depth).
+		if (inidata.get("DEBUG").has("IMAGE_ONLY_TEST"))
+			IMAGE_ONLY_TEST = inidata.get("DEBUG").get("IMAGE_ONLY_TEST") == "1";
+		if (inidata.get("DEBUG").has("IMAGE_ONLY_DIR"))
+			IMAGE_ONLY_DIR = inidata.get("DEBUG").get("IMAGE_ONLY_DIR");
+		if (inidata.get("DEBUG").has("IMAGE_ONLY_SAVE_DIR"))
+			IMAGE_ONLY_SAVE_DIR = inidata.get("DEBUG").get("IMAGE_ONLY_SAVE_DIR");
+		if (IMAGE_ONLY_TEST) logMessage("[DEBUG] IMAGE_ONLY_TEST: VA 2D inference over " + IMAGE_ONLY_DIR);
 
 		if (MODE_DEBUG || DEBUG_WITH_FILES || DEBUG_BATCH_JOB) logMessage("Debug Sensor Pos: " + DEBUG_SENSOR_POSITION);
 
@@ -1510,6 +1554,8 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("XT_TWOCONE_INSET")) XT_TWOCONE_INSET = std::stoi(ini.get("SETTINGS").get("XT_TWOCONE_INSET"));
 			if (ini.get("SETTINGS").has("MAX_RECONNECT_ATTEMPTS")) MAX_RECONNECT_ATTEMPTS = std::stoi(ini.get("SETTINGS").get("MAX_RECONNECT_ATTEMPTS"));
 			if (ini.get("SETTINGS").has("STREAM_FRAME_TIMEOUT")) STREAM_FRAME_TIMEOUT = std::stoi(ini.get("SETTINGS").get("STREAM_FRAME_TIMEOUT"));
+			if (ini.get("SETTINGS").has("WATCHDOG_NOFRAME_MS")) WATCHDOG_NOFRAME_MS = std::stoi(ini.get("SETTINGS").get("WATCHDOG_NOFRAME_MS"));
+			if (ini.get("SETTINGS").has("WATCHDOG_MAX_RECOVER")) WATCHDOG_MAX_RECOVER = std::stoi(ini.get("SETTINGS").get("WATCHDOG_MAX_RECOVER"));
 			logMessage("[INI] FORCE_ROI_MODE: " + std::to_string(FORCE_ROI_MODE)
 				+ " (LOCK_K:" + std::to_string(ROI_LOCK_K)
 				+ " LOCK_TOL:" + std::to_string(ROI_LOCK_TOL)
@@ -2639,6 +2685,10 @@ void parseCommand(char recvbuf[])
 			{
 				//rising edge.
 				logMessage("Enable Process Detected!");
+				//Arm the stream watchdog reference at process-enable: "no frame" is then measured from
+				//here, so a sensor that never connects / connects-but-sends-no-data also triggers the
+				//watchdog (previously g_lastFrameMs stayed 0 in that case and the watchdog skipped).
+				g_lastFrameMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
 
 				//streaming thread will be triggered from tmini_ctrl thread.
 				
@@ -3234,6 +3284,29 @@ auto get_valid_axis_value(
 	// Fallback to global min/max if no valid window found
 	return default_return;
 }
+
+//== Extraction guards (shared) ============================================================
+//Drop invalid (0,0,0) no-depth points BEFORE any min/max search. tilt_transform sanitizes
+//sensor NaN -> (0,0,0), and no-return pixels are (0,0,0); a dense zero cluster otherwise anchors
+//get_valid_* at the origin and excludes the real target (-> collapse / degenerate bounds).
+static pcl::PointCloud<pcl::PointXYZ>::Ptr drop_zero_points(const pcl::PointCloud<pcl::PointXYZ>::Ptr& in)
+{
+	pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
+	if (!in) return out;
+	out->points.reserve(in->points.size());
+	for (const auto& p : in->points)
+		if (!(p.x == 0.f && p.y == 0.f && p.z == 0.f)) out->points.push_back(p);
+	out->width = (uint32_t)out->points.size(); out->height = 1; out->is_dense = true;
+	return out;
+}
+//A slice loop `for(c=lo; c<hi; c+=step)` over an inverted or absurdly wide span (an outlier bound)
+//iterates enormously (effective hang) or not at all. Guard the span before every such loop.
+static const int SLICE_SPAN_LIMIT = 6000;	//mm; the whole working volume is well under this
+static inline bool slice_bounds_sane(int lo, int hi)
+{
+	return (hi > lo) && ((hi - lo) <= SLICE_SPAN_LIMIT);
+}
+//========================================================================================
 
 
 
@@ -4192,6 +4265,12 @@ pcl::PointXYZ pc_hole_detection(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInp
 	}
 }
 
+//Hole near-Z search band. The cone path guards its min-Z search with TROLLEY_RANGE_MIN/MAX, which is
+//what makes it immune to the no-depth zero cluster; the hole path had no guard at all. Kept WIDER than
+//TROLLEY_RANGE (1450..2150) so extreme container positions stay in view.
+static const float HOLE_Z_SEARCH_MIN = 1200.f;
+static const float HOLE_Z_SEARCH_MAX = 2300.f;
+
 pcl::PointXYZ pc_hole_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInput, bool target_on_right, std::string save_path)
 {
 	pcl::PointXYZ hole_position(-10000, 10000, -10000);
@@ -4204,20 +4283,40 @@ pcl::PointXYZ pc_hole_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_hole_filter_x(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_hole_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_axis_value(pcInput, 'z', false);
-		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_hole_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+
+		//Drop invalid (0,0,0) NO-DEPTH points FIRST -- same guard as pc_IGH_detection_naive.
+		//map_box_to_pc emits a literal (0,0,0) for every VA-box pixel with no depth return, and
+		//get_valid_axis_value's default outlier window (-10000..10000) accepts 0 as a VALID value.
+		//>=min_points(30) zeros then anchor local_min_z at 0, the near-Z pass-through becomes
+		//[-100,200] and EXCLUDES the real hole (z~1350..2550) -> empty cloud -> sentinel return.
+		//Measured on 20260723_LiveTest_2nd: 36 zeros -> min_z 0 (FAIL) vs 6 zeros -> min_z 1629 (OK);
+		//hole-only failure in 20/319 in-view frames, cone 0/319 (cone was already range-guarded).
+		//The X search below also runs on the RAW input (unlike the cone path, which computes X on the
+		//already Z-filtered cloud), so zeros could poison local_min_x too -- this filter covers both.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pcClean(new pcl::PointCloud<pcl::PointXYZ>);
+		pcClean->points.reserve(pcInput->points.size());
+		for (const auto& p : pcInput->points)
+			if (!(p.x == 0.f && p.y == 0.f && p.z == 0.f)) pcClean->points.push_back(p);
+		pcClean->width = (uint32_t)pcClean->points.size(); pcClean->height = 1; pcClean->is_dense = true;
+		if ((int)pcClean->points.size() < 30) return pcl::PointXYZ(-10000, -10000, -10000);
+
+		local_min_z = get_valid_axis_value(pcClean, 'z', false, 40.0f, 30, HOLE_Z_SEARCH_MIN, HOLE_Z_SEARCH_MAX);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_hole_" + std::to_string(local_min_z) + ".pcd", *pcClean);
+		//get_valid_axis_value returns -1 (empty) / -2 (no dense value inside the band). Bail out
+		//explicitly instead of letting a negative anchor build a nonsense pass-through window.
+		if (local_min_z < 0) return pcl::PointXYZ(-10000, -10000, -10000);
 		if (!target_on_right)
 		{
 			//max x
-			local_max_x = get_valid_axis_value(pcInput, 'x', true);
-			singlePassThrough(pcInput, local_max_x - 200, local_max_x + 100, -10000, 10000, -10000, 10000, init_hole_filter_x);
+			local_max_x = get_valid_axis_value(pcClean, 'x', true);
+			singlePassThrough(pcClean, local_max_x - 200, local_max_x + 100, -10000, 10000, -10000, 10000, init_hole_filter_x);
 			singlePassThrough(init_hole_filter_x, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 200, init_hole_filtered);
 		}
 		else
 		{
 			//min x
-			local_min_x = get_valid_axis_value(pcInput, 'x', false);
-			singlePassThrough(pcInput, local_min_x - 100, local_min_x + 200, -10000, 10000, -10000, 10000, init_hole_filter_x);
+			local_min_x = get_valid_axis_value(pcClean, 'x', false);
+			singlePassThrough(pcClean, local_min_x - 100, local_min_x + 200, -10000, 10000, -10000, 10000, init_hole_filter_x);
 			singlePassThrough(init_hole_filter_x, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 200, init_hole_filtered);
 		}
 		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_hole_filtered.pcd", *init_hole_filtered);
@@ -4374,29 +4473,37 @@ pcl::PointXYZ pc_cone_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr&
 	try
 	{
 		//X-Z directional limit for bigger ROI.
-		int local_min_x, local_max_x;
-		int local_min_y, local_max_y;
-		int local_min_z, local_max_z;
-		
+		int local_min_x = 0, local_max_x = 0;
+		int local_min_y = 0, local_max_y = 0;
+		int local_min_z = 0, local_max_z = 0;
+
+		//GUARD: drop (0,0,0) no-depth points, require enough real points.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pcClean = drop_zero_points(pcInput);
+		if ((int)pcClean->points.size() < 30) return cone_position;
+
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_axis_value(pcInput, 'z', false, 40.0f, 30, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX);
-		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+		local_min_z = get_valid_axis_value(pcClean, 'z', false, 40.0f, 30, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcClean);
+		if (local_min_z < 0) return cone_position;		//GUARD: no valid near-Z in range
 		if (!target_on_right)
 		{
-			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			singlePassThrough(pcClean, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
 			local_max_x = get_valid_axis_value(init_cone_filter_z, 'x', true);
 			singlePassThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
 		else
 		{
-			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			singlePassThrough(pcClean, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
 			local_min_x = get_valid_axis_value(init_cone_filter_z, 'x', false);
 			singlePassThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
 		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_cone_filtered.pcd", *init_cone_filtered);
 
+		if ((int)init_cone_filtered->points.size() < 10) return cone_position;	//GUARD: empty after filter
 		get_max_min_xyz(init_cone_filtered, ref(local_min_x), ref(local_max_x), ref(local_min_y), ref(local_max_y), ref(local_min_z), ref(local_max_z));
+		//GUARD: degenerate Y span -> the slice loop below would hang/no-op.
+		if (!slice_bounds_sane(local_min_y, local_max_y)) { logMessage("[GUARD] cone naive: bad Y bounds " + std::to_string(local_min_y) + ".." + std::to_string(local_max_y)); return cone_position; }
 
 		//slice through y direction with slice height = 20.
 
@@ -4607,39 +4714,49 @@ pcl::PointXYZ pc_cone_detection_preset(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 	pcl::PointXYZ cone_position(-10000, -10000, -10000);
 	try
 	{
-		//X-Z directional limit for bigger ROI.
-		int local_min_x, local_max_x;
-		int local_min_y, local_max_y;
-		int local_min_z, local_max_z;
+		//X-Z directional limit for bigger ROI.  (GUARD: initialise -- local_min_z was used in the
+		//save filename before assignment = C4700 uninitialised read, seen as garbage e.g. 1743470192.)
+		int local_min_x = 0, local_max_x = 0;
+		int local_min_y = 0, local_max_y = 0;
+		int local_min_z = 0, local_max_z = 0;
+
+		//GUARD: drop (0,0,0) no-depth points first, then require enough real points.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pcClean = drop_zero_points(pcInput);
+		if ((int)pcClean->points.size() < 30) return cone_position;
 
 		//1. Preset Range로 먼저 Extract.
 		pcl::PointCloud<pcl::PointXYZ>::Ptr preset_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		singlePassThrough(pcInput, presetRange.MIN, presetRange.MAX, HEIGHT_RANGE_MIN, HEIGHT_RANGE_MAX, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX, preset_cone_filtered);
-		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_preset_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+		singlePassThrough(pcClean, presetRange.MIN, presetRange.MAX, HEIGHT_RANGE_MIN, HEIGHT_RANGE_MAX, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX, preset_cone_filtered);
+		//GUARD: TROLLEY range on the near-Z search so a zero/floor cluster can't anchor min_z at 0.
+		local_min_z = get_valid_axis_value(pcClean, 'z', false, 40.0f, 30, TROLLEY_RANGE_MIN, TROLLEY_RANGE_MAX);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_preset_cone_" + std::to_string(local_min_z) + ".pcd", *pcClean);
 		if (save_path != std::string(""))
 		{
 			if (preset_cone_filtered->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(save_path + "_preset_cone.pcd", *preset_cone_filtered);
 		}
+		if (local_min_z < 0) return cone_position;		//GUARD: no valid near-Z in range
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_axis_value(pcInput, 'z', false);
-		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_cone_" + std::to_string(local_min_z) + ".pcd", *pcClean);
 		if (!target_on_right)
 		{
-			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			singlePassThrough(pcClean, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
 			local_max_x = get_valid_axis_value(init_cone_filter_z, 'x', true);
 			singlePassThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
 		else
 		{
-			singlePassThrough(pcInput, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
+			singlePassThrough(pcClean, -10000, 10000, -10000, 10000, local_min_z - 100, local_min_z + 300, init_cone_filter_z);
 			local_min_x = get_valid_axis_value(init_cone_filter_z, 'x', false);
 			singlePassThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, -10000, 10000, -10000, 10000, init_cone_filtered);
 		}
 		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_init_cone_filtered.pcd", *init_cone_filtered);
 
+		if ((int)init_cone_filtered->points.size() < 10) return cone_position;	//GUARD: empty after filter
 		get_max_min_xyz(init_cone_filtered, ref(local_min_x), ref(local_max_x), ref(local_min_y), ref(local_max_y), ref(local_min_z), ref(local_max_z));
+		//GUARD: degenerate Y span -> the slice loop below would hang/no-op. Bail with sentinel.
+		if (!slice_bounds_sane(local_min_y, local_max_y)) { logMessage("[GUARD] preset cone: bad Y bounds " + std::to_string(local_min_y) + ".." + std::to_string(local_max_y)); return cone_position; }
 
 		//slice through y direction with slice height = 20.
 
@@ -5328,11 +5445,24 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_min_z(pcInput);
-		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_land_" + std::to_string(local_min_z) + ".pcd", *pcInput);
+
+		//Drop invalid (0,0,0) NO-DEPTH points FIRST -- same guard as pc_hole/pc_IGH_detection_naive.
+		//This is the LANDED-state (idx2) detector, active during OFFLOAD/CLPS. A landed corner-casting
+		//box readily has no-depth pixels (holes/gaps between container and chassis); get_valid_min_z /
+		//get_valid_min_x accept 0 as valid (test is val > -10000), so >=30 zeros anchor min_z/min_x at 0
+		//and the near-Z / X pass-through excludes the real target -> collapse to (0,0,0)/sentinel.
+		pcl::PointCloud<pcl::PointXYZ>::Ptr pcClean(new pcl::PointCloud<pcl::PointXYZ>);
+		pcClean->points.reserve(pcInput->points.size());
+		for (const auto& p : pcInput->points)
+			if (!(p.x == 0.f && p.y == 0.f && p.z == 0.f)) pcClean->points.push_back(p);
+		pcClean->width = (uint32_t)pcClean->points.size(); pcClean->height = 1; pcClean->is_dense = true;
+		if ((int)pcClean->points.size() < 30) return cone_position;
+
+		local_min_z = get_valid_min_z(pcClean);
+		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_land_" + std::to_string(local_min_z) + ".pcd", *pcClean);
 		if (!target_on_right)
 		{
-			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
+			auto val = pc_passThrough(pcClean, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
 			//max x
 			local_max_x = get_valid_max_x(init_cone_filter_z);
 			val = pc_passThrough(init_cone_filter_z, local_max_x - 300, local_max_x + 100, "x", init_cone_filtered);
@@ -5341,9 +5471,9 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 		}
 		else
 		{
-			auto val = pc_passThrough(pcInput, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
+			auto val = pc_passThrough(pcClean, local_min_z - 100, local_min_z + 300, "z", init_cone_filter_z);
 			//min x
-			local_min_x = get_valid_min_x(pcInput);
+			local_min_x = get_valid_min_x(pcClean);
 			val = pc_passThrough(init_cone_filter_z, local_min_x - 100, local_min_x + 300, "x", init_cone_filtered);
 
 		}
@@ -5748,8 +5878,7 @@ pcl::PointXYZ pc_guide_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Ptr
 
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filter_z(new pcl::PointCloud<pcl::PointXYZ>);
 		pcl::PointCloud<pcl::PointXYZ>::Ptr init_cone_filtered(new pcl::PointCloud<pcl::PointXYZ>);
-		local_min_z = get_valid_min_z(pcInput);
-		local_min_z = get_valid_min_z(pcInput);
+		local_min_z = get_valid_min_z(pcInput);		//GUARD: was called twice (copy-paste dup)
 		if (save_path != std::string("")) pcl::io::savePCDFileBinaryCompressed(save_path + "_pre_init_guide_" + std::to_string(local_min_z) + ".pcd", *pcInput);
 		if (!target_on_right)
 		{
@@ -6525,6 +6654,7 @@ auto tmini_data_stream() -> void
 		
 		if (tmini_data_stream_flag) logMessage("Data Streaming Ready & Starting!");
 		last_frame_get_time = std::chrono::system_clock::now();	//reset the stall timer at stream start
+		g_lastFrameMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());	//arm watchdog
 		while (tmini_data_stream_flag)
 		{
 			auto waitDur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - last_frame_get_time).count();
@@ -6548,6 +6678,7 @@ auto tmini_data_stream() -> void
 					{
 						blnGetNewFrame = true;
 						last_frame_get_time = std::chrono::system_clock::now();
+						g_lastFrameMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());	//watchdog heartbeat
 
 						//no wait.	
 						bool isFrameGrabbed = false;					
@@ -6610,17 +6741,36 @@ auto tmini_data_stream() -> void
 
 								if (enable_stream)
 								{
+										cv::Mat dispImg = grayToClr.clone();	//draw overlays on a COPY -- the stored/saved image stays the ORIGINAL (training-clean)
 
 									if (ENABLE_PRESET_VISUAL_ON_STREAM)
 									{
 										auto presetBox = current_job_info.presetBox;
 										auto line = std::string(std::to_string(presetBox.x) + "," + std::to_string(presetBox.y) + "," + std::to_string(presetBox.w) + "," + std::to_string(presetBox.h));
 										
-										cv::putText(grayToClr, line, cv::Point(10, 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
-										drawDottedRect(grayToClr, cv::Rect(presetBox.x, presetBox.y, presetBox.w, presetBox.h), cv::Scalar(0, 0, 255), 1, 10);
+										cv::putText(dispImg, line, cv::Point(10, 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1);
+										drawDottedRect(dispImg, cv::Rect(presetBox.x, presetBox.y, presetBox.w, presetBox.h), cv::Scalar(0, 0, 255), 1, 10);
 									}
 
-									cv::imshow(CURRENT_SENSOR_POSITION + " T Mini", grayToClr);
+									//Live VA overlay: draw the latest FINAL target boxes (chassis + container). They
+									//lag the live image by ~1 inference cycle; the image itself stays real-time.
+									if (ENABLE_VA_VISUAL_ON_STREAM)
+									{
+										std::lock_guard<std::mutex> lk(g_vaOverlayMutex);
+										auto drawTarget = [&](const bbx& b, const cv::Scalar& color, const std::string& tag)
+										{
+											if (b.prob > 0 && b.x >= 0 && b.y >= 0)		//x = -10000 when not detected
+											{
+												cv::rectangle(dispImg, cv::Rect((int)b.x, (int)b.y, (int)b.w, (int)b.h), color, 2);
+												cv::putText(dispImg, tag + " " + b.label + " " + std::to_string((int)b.prob),
+													cv::Point((int)b.x, std::max(0, (int)b.y - 4)), cv::FONT_HERSHEY_SIMPLEX, 0.4, color, 1);
+											}
+										};
+										drawTarget(g_vaOverlayContainer, cv::Scalar(0, 255, 0), "CTNR");		//container = green
+										drawTarget(g_vaOverlayChassis,   cv::Scalar(255, 128, 0), "CHAS");		//chassis  = blue
+									}
+
+									cv::imshow(CURRENT_SENSOR_POSITION + " T Mini", dispImg);
 									cv::waitKey(1);
 								}
 								else
@@ -8347,6 +8497,8 @@ bool position_detection_pca(JobInfo jobInfo, bool usePreset, bool isFrontSensor,
 {
 	try
 	{
+		if (ENABLE_STAGE_LOG) logMessage("[STAGE] position_detection_pca: type=" + ChassisType + " usePreset=" + std::to_string(usePreset)
+			+ " pts h/c/g=" + std::to_string(pcHole->points.size()) + "/" + std::to_string(pcCone->points.size()) + "/" + std::to_string(pcGuide->points.size()));
 		if (pcHole->points.size() > 0)
 		{
 			hole_pos = pc_hole_detection_naive(pcHole, target_on_right, save_path);
@@ -10032,13 +10184,19 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			}
 			if (!DEV3D_mount_dev_phase)
 			{
-				pcl::PointXYZ p = DEV3D_RefLatch.value();		//sentinel (-10000) until locked
+				//POSITION phase: output the RAW LIVE chassis-ref (cone/guide) until the latch
+				//locks, then the stable latched value. Before lock value() is a sentinel that
+				//blacked out the PLC monitor; raw live position keeps the field observable
+				//(only -10000 when nothing is actually detected this frame).
+				pcl::PointXYZ p = DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : chRef;
 				_dev3d_out_x = (int)p.x; _dev3d_out_y = (int)p.y; _dev3d_out_z = (int)p.z;
 				_dev3d_is_position = true;
 			}
 			else
 			{
-				devFromLatchedRef(DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : INVALID_PT);
+				//Before lock, fall back to the raw live chRef (same as the offload path) so the
+				//deviation is still emitted instead of a sentinel.
+				devFromLatchedRef(DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : chRef);
 			}
 		}
 		else if (jobInfo.isOffloadCycle)
@@ -10047,7 +10205,9 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			if (_clps_ok_detected) DEV3D_offload_dev_phase = true;	//VA cone-idx1+hole separation (sticky)
 			if (!DEV3D_offload_dev_phase)
 			{
-				pcl::PointXYZ p = DEV3D_HoleLatch.value();
+				//POSITION phase: raw LIVE hole position until the latch locks (field monitoring),
+				//then the stable latched value.
+				pcl::PointXYZ p = DEV3D_HoleLatch.locked() ? DEV3D_HoleLatch.value() : _hole_pos;
 				_dev3d_out_x = (int)p.x; _dev3d_out_y = (int)p.y; _dev3d_out_z = (int)p.z;
 				_dev3d_is_position = true;
 			}
@@ -10371,7 +10531,16 @@ void processingThread()
 										auto pointCloud = pointCloud_tilt_transform(pre_pointCloud, TILT_ANGLE_DEG);
 										//pcl::io::savePCDFileBinaryCompressed(save_path + "_base_converted.pcd", *pointCloud);
 
+										if (ENABLE_STAGE_LOG) logMessage("[STAGE] frame " + std::to_string(frame_index) + " ProcessLogic START");
 										current_process_results = ProcessLogic(isFrontSensor, current_job_info, img, pointCloud, std::string(""), false, false, ref(log_lines));
+										if (ENABLE_STAGE_LOG) logMessage("[STAGE] frame " + std::to_string(frame_index) + " ProcessLogic done");
+
+										//Publish the latest VA target boxes for the live-stream overlay (data-stream thread reads these).
+										{
+											std::lock_guard<std::mutex> lk(g_vaOverlayMutex);
+											g_vaOverlayChassis   = current_process_results.VA_Target_Chassis;
+											g_vaOverlayContainer = current_process_results.VA_Target_Container;
+										}
 
 										Simfile.open(sim_result_txt.c_str(), ios::out | ios::app);
 										if (!Simfile.is_open())
@@ -11044,6 +11213,142 @@ void socketClient(const std::string& server_ip, int server_port)
 	WSACleanup();
 }
 
+//Image-only VA (2D) inference test. Runs the active detector over every .jpg under
+//IMAGE_ONLY_DIR (recursive, NO depth / NO 3D), draws boxes, and writes:
+//  - <IMAGE_ONLY_SAVE_DIR>/<name>_result.jpg  (annotated)
+//  - <IMAGE_ONLY_SAVE_DIR>/inference_results.csv (per-image detections)
+//Use to validate a new model's recognition before deploy. yolo_detector must be
+//initialized first (done in main before dispatch).
+void ImageOnlyInferenceTest()
+{
+	logMessage("[IMG-ONLY] Image-only VA inference test on: " + IMAGE_ONLY_DIR);
+	auto imgs = getAllFiles(IMAGE_ONLY_DIR, ".jpg");
+	if (imgs.empty()) { logMessage("[IMG-ONLY] No .jpg found under " + IMAGE_ONLY_DIR); return; }
+	createDirectory_ifexists(IMAGE_ONLY_SAVE_DIR);
+	std::string noDetDir = IMAGE_ONLY_SAVE_DIR + "/no_detection";	//originals of images with 0 detections
+	createDirectory_ifexists(noDetDir);
+
+	std::string csvPath = IMAGE_ONLY_SAVE_DIR + "/inference_results.csv";
+	std::ofstream csv(csvPath.c_str(), std::ios::out | std::ios::trunc);
+	csv << "Filename;DetCount;ClassCounts(" ;
+	for (size_t c = 0; c < class_names.size(); c++) csv << class_names[c] << (c + 1 < class_names.size() ? "," : "");
+	csv << ");Detections(idx:label:x:y:w:h:prob;...)\n";
+
+	int total = 0, withDet = 0, skipped = 0;
+	std::vector<int> classTotals(class_names.size(), 0);
+	for (const auto& ip : imgs)
+	{
+		//Skip prior result/annotated images (batch outputs *_result.jpg / *_debug_result.jpg,
+		//and this harness's own *_result.jpg) so re-running over a tree doesn't re-process them.
+		std::string fname = boost::filesystem::path(ip).filename().string();
+		std::string fnameLo = fname; std::transform(fnameLo.begin(), fnameLo.end(), fnameLo.begin(), ::tolower);
+		if (fnameLo.find("result") != std::string::npos) { skipped++; continue; }
+
+		cv::Mat image = cv::imread(ip);
+		if (image.empty()) { logMessage("[IMG-ONLY] skip unreadable: " + ip); continue; }
+		total++;
+
+		cv::Mat res_image;
+		std::vector<rectangle_info> det_results;
+		std::vector<std::vector<bbx>> det_sorted;
+		int det_count = 0;
+		std::string base = boost::filesystem::path(ip).stem().string();
+		std::string save_path = IMAGE_ONLY_SAVE_DIR + "/" + base;	//non-empty -> yolo_inference draws res_image
+
+		yolo_inference(yolo_detector, image, ref(res_image), ref(det_results), ref(det_sorted), ref(det_count), save_path);
+
+		if (det_count > 0)
+		{
+			withDet++;
+			if (!res_image.empty()) cv::imwrite(save_path + "_result.jpg", res_image);	//annotated -> flat in SAVE_DIR
+		}
+		else
+		{
+			cv::imwrite(noDetDir + "/" + base + ".jpg", image);		//not recognized -> ORIGINAL kept separately
+		}
+
+		std::string counts, dets;
+		for (size_t c = 0; c < det_sorted.size(); c++)
+		{
+			counts += std::to_string(det_sorted[c].size()) + (c + 1 < det_sorted.size() ? "," : "");
+			classTotals[c] += (int)det_sorted[c].size();
+			for (const auto& b : det_sorted[c])
+				dets += std::to_string(b.index) + ":" + b.label + ":" + std::to_string(b.x) + ":" + std::to_string(b.y)
+				      + ":" + std::to_string(b.w) + ":" + std::to_string(b.h) + ":" + std::to_string(b.prob) + ";";
+		}
+		csv << base << ";" << det_count << ";" << counts << ";" << dets << "\n";
+	}
+	csv.close();
+
+	std::string summary = "[IMG-ONLY] done. images=" + std::to_string(total)
+		+ " withDetection=" + std::to_string(withDet)
+		+ " noDetection=" + std::to_string(total - withDet)
+		+ " skipped(result-named)=" + std::to_string(skipped)
+		+ " (" + (total ? std::to_string(100 * withDet / total) : std::string("0")) + "% recognized). Per-class:";
+	for (size_t c = 0; c < class_names.size(); c++) summary += " " + class_names[c] + "=" + std::to_string(classTotals[c]);
+	logMessage(summary);
+	logMessage("[IMG-ONLY] CSV: " + csvPath);
+}
+
+
+//Stream watchdog: detects a wedged data-stream thread (blocking getNextFrame on a camera/network
+//stall) and recovers it, or force-restarts if unrecoverable. Runs independently of the (possibly
+//blocked) data-stream thread. Only closes the stream via the public API -- SICK lib untouched.
+void streamWatchdogThread()
+{
+	using namespace std::chrono;
+	auto nowMs = []() { return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(); };
+	logMessage("[WATCHDOG] Stream watchdog started (noFrame " + std::to_string(WATCHDOG_NOFRAME_MS)
+		+ "ms, maxRecover " + std::to_string(WATCHDOG_MAX_RECOVER) + ")");
+
+	while (watchdog_running.load())
+	{
+		std::this_thread::sleep_for(milliseconds(1000));
+		if (!watchdog_running.load()) break;
+
+		//Only watch when the PROCESS is enabled (PLC wants the app working). During intentional idle
+		//(disabled) we reset so there is no false fire.
+		//BUGFIX: was gated on `enabled_stream`, which is NEVER set true -> the whole watchdog was
+		//silently dead. Gate on `enable_process` (the real PLC enable, set at byte18[1]).
+		if (!enable_process)
+		{
+			g_watchdogRecover.store(0);
+			continue;
+		}
+
+		long long last = g_lastFrameMs.load();		//armed at process-enable; updated on each frame
+		if (last == 0) continue;					//not armed yet (pre-enable)
+
+		long long idle = nowMs() - last;
+		if (idle <= WATCHDOG_NOFRAME_MS)
+		{
+			if (g_watchdogRecover.load() != 0) g_watchdogRecover.store(0);	//frames flowing -> reset
+			continue;
+		}
+
+		int n = g_watchdogRecover.fetch_add(1) + 1;
+		logMessage("[WATCHDOG] No new frame for " + std::to_string(idle) + "ms while streaming -> recover attempt "
+			+ std::to_string(n) + "/" + std::to_string(WATCHDOG_MAX_RECOVER));
+
+		if (n > WATCHDOG_MAX_RECOVER)
+		{
+			logMessage("[WATCHDOG] Stream unrecoverable after " + std::to_string(WATCHDOG_MAX_RECOVER)
+				+ " attempts -> forcing process restart (PM manager).");
+			std::this_thread::sleep_for(milliseconds(300));		//let the log thread flush
+			TerminateProcess(GetCurrentProcess(), 2);			//hard kill: a wedged thread must not block cleanup
+		}
+		else
+		{
+			//Close the stream from here to unblock a getNextFrame() stuck in a blocking recv; the
+			//existing control-thread reconnect then re-opens. close() is public and no-op-safe.
+			sensor_fault = true;
+			dataStream.close();
+			g_lastFrameMs.store(nowMs());		//arm the next detection window for the reconnect to work
+		}
+	}
+	logMessage("[WATCHDOG] Stream watchdog stopped.");
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -11193,7 +11498,12 @@ int main(int argc, char* argv[])
 
 	//model_initialized = (detections.size() > 0) ? true : false;
 
-	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
+	if (IMAGE_ONLY_TEST)
+	{
+		//Image-only VA (2D) inference test -- no depth, no 3D. Model already initialized above.
+		ImageOnlyInferenceTest();
+	}
+	else if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
 	{
 		//test();
 
@@ -11268,11 +11578,17 @@ int main(int argc, char* argv[])
 		std::thread sckProcess(processingThread);
 		std::thread sckSave(data_save_thread);
 
+		//Independent stream watchdog (unblock/recover a wedged data-stream; force-restart if not).
+		//Detached: it either force-terminates the process or exits when watchdog_running is cleared.
+		watchdog_running.store(true);
+		std::thread(streamWatchdogThread).detach();
 
 		if (sckProcess.joinable()) sckProcess.join();
 		if (sckTMini_Setup.joinable()) sckTMini_Setup.join();
 		if (sckTMini_Data_Stream.joinable()) sckTMini_Data_Stream.join();
-		
+
+		watchdog_running.store(false);	//stop the detached stream watchdog before teardown
+
 		if (trigger_terminate)
 		{
 			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
