@@ -151,12 +151,11 @@ const float confThreshold = 0.5f;  // Match Ultralytics default confidence thres
 const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 
 /*
-* Update: 2025.08.19
-* Update Log:
-*	Added CLPS OK (chassis-container separation detection logic)
+* Update: 2026.08.19
+* Update Log
 */
 
-const std::string program_version = "1.6";
+const std::string program_version = "1.6R1";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -535,6 +534,10 @@ bool ENALBE_RESTART_APPLICATION = false;
 bool ENABLE_SAVE_LOG_BIT = false;
 bool ENABLE_PRESET_VISUAL_ON_STREAM = false;
 bool ENABLE_VA_VISUAL_ON_STREAM = false;	//overlay the latest VA target boxes on the live stream
+//VA 2D preset fallback: when the model misses the cone/chassis, substitute the per-job preset box
+//(prob forced to 50). Default ON = legacy behavior. Set [SYSTEM] ENABLE_VA_PRESET=0 to disable, so a
+//VA miss stays a genuine miss (chassis -> -10000) and 3D is recovered via ROI_FALLBACK instead.
+bool ENABLE_VA_PRESET = true;
 bool ENABLE_IMAGE_LOGGING_ONLY = false;
 
 std::string CURRENT_SENSOR_POSITION = "FRONT";
@@ -1428,6 +1431,10 @@ auto parseINI(string path) -> bool
 		ENABLE_PRESET_VISUAL_ON_STREAM = inidata.get("SYSTEM").get("ENABLE_PRESET_VISUAL_ON_STREAM") == "1" ? true : false;
 		if (inidata.get("SYSTEM").has("ENABLE_VA_VISUAL_ON_STREAM"))
 			ENABLE_VA_VISUAL_ON_STREAM = inidata.get("SYSTEM").get("ENABLE_VA_VISUAL_ON_STREAM") == "1";
+		//VA 2D preset fallback on/off (default ON = legacy). Optional key -> absence keeps default.
+		if (inidata.get("SYSTEM").has("ENABLE_VA_PRESET"))
+			ENABLE_VA_PRESET = inidata.get("SYSTEM").get("ENABLE_VA_PRESET") == "1";
+		logMessage(std::string("VA preset fallback: ") + (ENABLE_VA_PRESET ? "ENABLED" : "DISABLED"));
 		ENABLE_IMAGE_LOGGING_ONLY = inidata.get("SYSTEM").get("ENABLE_IMAGE_LOGGING_ONLY") == "1" ? true : false;
 		//Per-frame/stage tracing -- DEFAULT ON; set [SYSTEM] ENABLE_STAGE_LOG=0 to silence.
 		if (inidata.get("SYSTEM").has("ENABLE_STAGE_LOG"))
@@ -9729,7 +9736,7 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	}
 #pragma endregion
 
-	if (!FORCE_ROI_MODE && _target_cone.prob == 0)
+	if (!FORCE_ROI_MODE && ENABLE_VA_PRESET && _target_cone.prob == 0)
 	{
 		usePreset = true;
 		_target_cone = jobInfo.presetBox;
