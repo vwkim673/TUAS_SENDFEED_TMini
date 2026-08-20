@@ -155,7 +155,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 * Update Log
 */
 
-const std::string program_version = "1.6R1";
+const std::string program_version = "1.6R2";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -689,6 +689,18 @@ int WATCHDOG_MAX_RECOVER = 3;
 std::atomic<long long> g_lastFrameMs{ 0 };	//atomic mirror of last_frame_get_time (ms since epoch)
 std::atomic<int> g_watchdogRecover{ 0 };
 std::atomic<bool> watchdog_running{ true };
+
+//PLC socket monitoring / robustness. The client loop used a BLOCKING recv() with no timeout, so a
+//silent or half-open PLC link parked the thread forever -> no heartbeat sent, no logs, until the PLC
+//raised a heartbeat fault hours later. SO_RCVTIMEO makes recv() return periodically so we can keep
+//sending heartbeat, surface a dead socket via a failing send, and log link state for monitoring.
+//All optional in process.ini [SETTINGS]; defaults below apply when the key is absent.
+int PLC_RECV_TIMEOUT_MS = 1000;		//recv() wakes at least this often even when the PLC is quiet
+int PLC_SILENCE_WARN_MS = 3000;		//warn (throttled) when no PLC data arrives for this long
+int PLC_STATUS_LOG_MS   = 10000;	//cadence of the periodic "[PLC] alive" status line
+//Last successful PLC recv/send (ms since epoch) -- exposed for monitoring / future socket watchdog.
+std::atomic<long long> g_plcLastRecvMs{ 0 };
+std::atomic<long long> g_plcLastSendMs{ 0 };
 
 bool enabled_stream = false, enabled_process = false, enabled_logging = false;
 
@@ -1563,6 +1575,9 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("STREAM_FRAME_TIMEOUT")) STREAM_FRAME_TIMEOUT = std::stoi(ini.get("SETTINGS").get("STREAM_FRAME_TIMEOUT"));
 			if (ini.get("SETTINGS").has("WATCHDOG_NOFRAME_MS")) WATCHDOG_NOFRAME_MS = std::stoi(ini.get("SETTINGS").get("WATCHDOG_NOFRAME_MS"));
 			if (ini.get("SETTINGS").has("WATCHDOG_MAX_RECOVER")) WATCHDOG_MAX_RECOVER = std::stoi(ini.get("SETTINGS").get("WATCHDOG_MAX_RECOVER"));
+			if (ini.get("SETTINGS").has("PLC_RECV_TIMEOUT_MS")) PLC_RECV_TIMEOUT_MS = std::stoi(ini.get("SETTINGS").get("PLC_RECV_TIMEOUT_MS"));
+			if (ini.get("SETTINGS").has("PLC_SILENCE_WARN_MS")) PLC_SILENCE_WARN_MS = std::stoi(ini.get("SETTINGS").get("PLC_SILENCE_WARN_MS"));
+			if (ini.get("SETTINGS").has("PLC_STATUS_LOG_MS")) PLC_STATUS_LOG_MS = std::stoi(ini.get("SETTINGS").get("PLC_STATUS_LOG_MS"));
 			logMessage("[INI] FORCE_ROI_MODE: " + std::to_string(FORCE_ROI_MODE)
 				+ " (LOCK_K:" + std::to_string(ROI_LOCK_K)
 				+ " LOCK_TOL:" + std::to_string(ROI_LOCK_TOL)
@@ -2700,7 +2715,10 @@ void parseCommand(char recvbuf[])
 				//streaming thread will be triggered from tmini_ctrl thread.
 				
 				//Create necessary job result folders and specify names.
-				job_result_folder_name = std::string("JOB_LOG/");
+				//Anchor to app_path (the exe folder) so job data lands next to /Log regardless of
+				//the launcher's working directory (PM Manager / shortcut / double-click) -- a relative
+				//"JOB_LOG/" resolved against an unpinned CWD, scattering pcd/jpg across drives.
+				job_result_folder_name = app_path + std::string("/JOB_LOG/");
 				createDirectory_ifexists(job_result_folder_name);
 				job_result_folder_name += std::string("Lane") + std::to_string(target_lane_number) + "/";
 				createDirectory_ifexists(job_result_folder_name);
@@ -2823,7 +2841,9 @@ void parseCommand(char recvbuf[])
 				//rising edge.
 				logMessage("Enable Logging Detected!");
 
-				saveDirName = std::string("SAVE/");
+				//Anchor to app_path (exe folder) -- same reason as JOB_LOG above: keep the raw
+				//SAVE recording inside the app folder, not under an unpinned CWD.
+				saveDirName = app_path + std::string("/SAVE/");
 				//saveDirName += std::string("Lane") + std::to_string(target_lane_number) + "/";
 				createDirectory_ifexists(saveDirName);
 
@@ -11157,54 +11177,121 @@ void socketClient(const std::string& server_ip, int server_port)
 	while (socket_running) {
 		SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 		if (sock == INVALID_SOCKET) {
-			logMessage("Socket creation failed");
+			logMessage("[PLC] Socket creation failed: " + std::to_string(WSAGetLastError()));
 			std::this_thread::sleep_for(std::chrono::seconds(2));
 			continue;
 		}
+
+		//Recv/send timeouts so a silent or half-open PLC link can't block this thread forever (the
+		//old blocking recv() had none -> silent infinite idle, no heartbeat, no logs, until the PLC
+		//raised a heartbeat fault hours later). SO_KEEPALIVE lets TCP notice a dead peer even while
+		//we are only receiving.
+		DWORD rcvto = (DWORD)PLC_RECV_TIMEOUT_MS;
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvto, sizeof(rcvto));
+		DWORD sndto = 2000;
+		setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndto, sizeof(sndto));
+		BOOL keepalive = TRUE;
+		setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive, sizeof(keepalive));
 
 		sockaddr_in server_addr{};
 		server_addr.sin_family = AF_INET;
 		server_addr.sin_port = htons(server_port);
 		inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr);
 
-		logMessage("Attempting to connect to " + server_ip + ":" + std::to_string(server_port) + "...");
+		logMessage("[PLC] Connecting to " + server_ip + ":" + std::to_string(server_port) + " ...");
 		if (connect(sock, (sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-			logMessage("Connection failed: " + std::to_string(WSAGetLastError()));
+			logMessage("[PLC] Connect FAILED err=" + std::to_string(WSAGetLastError()) + " -- retry in 2s");
 			closesocket(sock);
 			std::this_thread::sleep_for(std::chrono::seconds(2));
 			continue;
 		}
 
-		logMessage("Connected to server!");
+		logMessage("[PLC] Connected to server " + server_ip + ":" + std::to_string(server_port));
 
-		//initial send?
+		//local clock (ms since epoch)
+		auto plcNowMs = []() -> long long {
+			return std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::system_clock::now().time_since_epoch()).count();
+		};
+
+		//initial send (kick the PLC request/response)
 		char sendbuf_init[DEFAULT_SENDLEN] = { 0 };
-		//makeCommand(ref(sendbuf));
-		int bytesSent_init = send(sock, sendbuf_init, DEFAULT_SENDLEN, 0);
+		send(sock, sendbuf_init, DEFAULT_SENDLEN, 0);
 
-		// Sample loop: Read from server
+		//per-connection monitoring state
+		long long connStartMs       = plcNowMs();
+		long long lastRecvMs        = connStartMs;
+		long long lastStatusMs      = connStartMs;
+		long long lastSilenceWarnMs = 0;
+		long long rxCount = 0, txCount = 0;
+		unsigned short lastStatusHb = heartbeat_;	//heartbeat at the previous status pulse (advance check)
+		bool firstDataSeen = false;
+
 		char buffer[DEFAULT_RECVLEN] = { 0 };
 		while (socket_running) {
 			int bytesReceived = recv(sock, buffer, sizeof(buffer), 0);
-			if (bytesReceived <= 0) {
-				logMessage("Disconnected from server");
+			long long now = plcNowMs();
+
+			if (bytesReceived > 0) {
+				lastRecvMs = now; rxCount++;
+				g_plcLastRecvMs.store(now);
+				if (!firstDataSeen) {
+					firstDataSeen = true;
+					logMessage("[PLC] first data from server (" + std::to_string(bytesReceived) + " bytes) -- link OK");
+				}
+				parseCommand(buffer);
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+			else if (bytesReceived == 0) {
+				//graceful close by the PLC (FIN)
+				logMessage("[PLC] server closed connection (recv=0) after "
+					+ std::to_string((now - connStartMs) / 1000) + "s -- reconnecting");
 				break;
 			}
-			//buffer[bytesReceived] = '\0';
-			std::string received_msg(buffer);
-			
-			parseCommand(buffer);
+			else {
+				int err = WSAGetLastError();
+				if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+					//No data within the recv window. NOT a disconnect: keep the loop alive, warn
+					//(throttled) about the silence, and still send a heartbeat below so a truly dead
+					//socket surfaces as a failing send -> reconnect.
+					long long silentMs = now - lastRecvMs;
+					if (silentMs >= PLC_SILENCE_WARN_MS && (now - lastSilenceWarnMs) >= PLC_SILENCE_WARN_MS) {
+						logMessage("[PLC] NO DATA from server for " + std::to_string(silentMs / 1000)
+							+ "s (link up, still sending heartbeat; enProc=" + std::to_string((int)enable_process) + ")");
+						lastSilenceWarnMs = now;
+					}
+				}
+				else {
+					logMessage("[PLC] recv error err=" + std::to_string(err) + " -- reconnecting");
+					break;
+				}
+			}
 
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+			//Send heartbeat/command -- runs after a received frame AND on a recv timeout, so our side
+			//keeps transmitting even when the PLC is quiet, and a dead link is detected by send failing.
 			char sendbuf[DEFAULT_SENDLEN] = { 0 };
 			makeCommand(ref(sendbuf));
-
 			int bytesSent = send(sock, sendbuf, DEFAULT_SENDLEN, 0);
-			if (bytesSent <= 0)
-			{
-				logMessage("Sending data failed! " + std::to_string(bytesSent));
+			if (bytesSent <= 0) {
+				logMessage("[PLC] send FAILED err=" + std::to_string(WSAGetLastError()) + " -- reconnecting");
 				break;
+			}
+			txCount++;
+			g_plcLastSendMs.store(now);
+
+			//Periodic status line so monitoring always has a recent pulse of the PLC link. dHb =
+			//heartbeat advance since the last pulse: the PLC (server) increments it and we only echo,
+			//so dHb>0 == PLC counting == connection healthy; dHb==0 while up == PLC silent/stuck.
+			//(unsigned short subtraction gives the correct forward distance across the 65535 wrap.)
+			if ((now - lastStatusMs) >= PLC_STATUS_LOG_MS) {
+				lastStatusMs = now;
+				int dHb = (int)(unsigned short)(heartbeat_ - lastStatusHb);
+				lastStatusHb = heartbeat_;
+				logMessage("[PLC] alive up=" + std::to_string((now - connStartMs) / 1000)
+					+ "s lastRecv=" + std::to_string(now - lastRecvMs) + "ms"
+					+ " rx=" + std::to_string(rxCount) + " tx=" + std::to_string(txCount)
+					+ " hb=" + std::to_string(heartbeat_) + " dHb=+" + std::to_string(dHb)
+					+ " enProc=" + std::to_string((int)enable_process));
 			}
 		}
 
@@ -11213,7 +11300,7 @@ void socketClient(const std::string& server_ip, int server_port)
 		reset_recvVariables();
 
 		closesocket(sock);
-		logMessage("Connection closed. Retrying in 2 seconds...");
+		logMessage("[PLC] Connection closed. Retrying in 2 seconds...");
 		std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait before retry
 	}
 
