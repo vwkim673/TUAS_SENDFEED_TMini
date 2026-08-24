@@ -151,11 +151,12 @@ const float confThreshold = 0.5f;  // Match Ultralytics default confidence thres
 const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 
 /*
-* Update: 2026.08.19
+* Update: 2026.08.21
 * Update Log
+* Application shutdown bit update.
 */
 
-const std::string program_version = "1.6R2";
+const std::string program_version = "1.6R4";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -783,6 +784,12 @@ bool Rear_Logging = false;
 
 bool trigger_log_delete = false;
 bool trigger_terminate = false;
+//PLC shutdown bit (byte19[1]) is LATCHED here rather than acted on instantly: terminate only once
+//the process is OFF and the save queue (tsq) has drained. While waiting we log status every 10s and
+//shut down the instant the queue empties. Gated on the CURRENT process-off STATE (not the old
+//on->off edge in trigger_terminate, which stayed false when the app was simply off since connect).
+bool g_shutdownPending = false;
+long long g_shutdownWaitLogMs = 0;	//throttle (ms since epoch) for the "waiting to shut down" status log
 
 int tCntr_x, tCntr_y, tCntr_prob;
 int tCone_x, tCone_y, tCone_prob;
@@ -2049,6 +2056,7 @@ void reset_recvVariables()
 
 	enable_stream = false; enable_process = false; enable_logging = false; enable_save_logs = false;
 	Connected_Sensor_Reboot = false; Application_Shutdown = false;
+	g_shutdownPending = false;	//re-arm only if the PLC still asserts the shutdown bit after reconnect
 
 	logMessage("Resetting received variables from PLC");
 }
@@ -2220,39 +2228,52 @@ std::vector<std::string> ListSubDirectories(const std::string& directoryPath) {
 	return subDirs;
 }
 
+//Safe per-lane IP lookup. Lane_Number comes straight from PLC bytes 8-9 and is used as
+//[Lane_Number-1]; a bad/placeholder job (bay 0 -> Lane_Number 0 -> index -1, or a lane beyond the
+//configured sensor count) would be an OUT-OF-BOUNDS vector access = undefined behavior (seen in the
+//field as an empty IP, but could equally be a garbage IP or a crash). Return "" for any out-of-range
+//lane so the setup path skips the connect instead of indexing out of bounds.
+static std::string laneIpSafe(const std::vector<std::string>& ips, int lane)
+{
+	if (lane < 1 || lane > (int)ips.size()) return std::string("");
+	return ips[(size_t)(lane - 1)];
+}
+
 void selectTargetSensor()
 {
 	if (CURRENT_SENSOR_POSITION == "FRONT")
 	{
 		if (Job_Pos_S) //Use Center Sensor.
 		{
-			current_lane_ip = CENTER_IP_ADDRESSES[Lane_Number - 1];
+			current_lane_ip = laneIpSafe(CENTER_IP_ADDRESSES, Lane_Number);
 			current_lane_camera = "CS" + std::to_string(Lane_Number);
-			logMessage("Sensor ip from Front App: " + current_lane_ip);
 		}
 		else //Use Front Sensor.
 		{
-			current_lane_ip = FRONT_IP_ADDRESSES[Lane_Number - 1];
+			current_lane_ip = laneIpSafe(FRONT_IP_ADDRESSES, Lane_Number);
 			current_lane_camera = "FS" + std::to_string(Lane_Number);
-			logMessage("Sensor ip from Front App: " + current_lane_ip);
 		}
+		logMessage("Sensor ip from Front App: " + current_lane_ip);
 	}
 	else
 	{
 		if (Job_Pos_B) //Use Center Sensor
 		{
-			current_lane_ip = CENTER_IP_ADDRESSES[Lane_Number - 1];
+			current_lane_ip = laneIpSafe(CENTER_IP_ADDRESSES, Lane_Number);
 			current_lane_camera = "CS" + std::to_string(Lane_Number);
-			logMessage("Sensor ip from Rear App: " + current_lane_ip);
 		}
 		else //Use Rear Sensor.
 		{
-			current_lane_ip = REAR_IP_ADDRESSES[Lane_Number - 1];
+			current_lane_ip = laneIpSafe(REAR_IP_ADDRESSES, Lane_Number);
 			current_lane_camera = "RS" + std::to_string(Lane_Number);
-			logMessage("Sensor ip from Rear App: " + current_lane_ip);
 		}
-
+		logMessage("Sensor ip from Rear App: " + current_lane_ip);
 	}
+
+	//Invalid/unmapped bay (e.g. PLC sent Lane_Number=0 / bay 0, which does not exist) -> no IP.
+	if (current_lane_ip.empty())
+		logMessage("[SETUP] invalid/unmapped Lane_Number=" + std::to_string(Lane_Number)
+			+ " (no such bay) -> empty IP; sensor setup will be skipped");
 }
 
 auto makeCommand(char* sendbuf) -> void {
@@ -2789,7 +2810,7 @@ void parseCommand(char recvbuf[])
 			//but the sensor is disconnected AND we are NOT already retrying (i.e. the control loop
 			//gave up after MAX_RECONNECT_ATTEMPTS), start a FRESH reconnect cycle after a cooldown.
 			//sensor_fault is NOT cleared here -- it stays visible to the PLC until we reconnect.
-			if (enable_process && !sensor_connected && !tmini_ctrl_flag)
+			if (enable_process && !sensor_connected && !tmini_ctrl_flag && !current_lane_ip.empty())
 			{
 				auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - sensor_last_attempted_time).count();
 				if (ts > 10000) //10s cooldown since the last setup attempt
@@ -2888,35 +2909,84 @@ void parseCommand(char recvbuf[])
 			tVal = (bool)byte19[1];
 			if (tVal && tVal != Application_Shutdown)
 			{
-				logMessage("Application Shutdown Command Detected!");
-
+				//Rising edge: latch a pending shutdown. Actual termination is deferred to the handler
+				//below so in-flight saves can flush first.
+				logMessage("Application Shutdown Command Detected! restart=" + std::to_string(ENALBE_RESTART_APPLICATION)
+					+ " enProc=" + std::to_string((int)enable_process) + " tsq=" + std::to_string((int)tsq.size()));
 				if (ENALBE_RESTART_APPLICATION)
 				{
-					if (trigger_terminate && tsq.size() == 0)
-					{
-						logMessage("Triggered Application Termination!");
-
-						//Nothing to save.	
-						proc_running.store(false);
-						cond_processing.notify_one();
-
-						logging_running.store(false);
-						cond_logging.notify_one();
-
-						tmini_ctrl_running.store(false);
-						cond_tmini_ctrl.notify_one();
-
-						tmini_data_stream_running.store(false);
-						cond_tmini_data_stream.notify_one();
-
-						socket_running.store(false);
-
-						logMessage("Threads to be terminated.");
-					}
+					g_shutdownPending = true;
+					g_shutdownWaitLogMs = 0;	//force an immediate status line on the first wait check
 				}
-
+			}
+			else if (!tVal && Application_Shutdown && g_shutdownPending)
+			{
+				//PLC cleared the shutdown bit before we terminated -> abort the pending shutdown.
+				logMessage("[SHUTDOWN] shutdown bit cleared -> pending shutdown CANCELLED.");
+				g_shutdownPending = false;
 			}
 			Application_Shutdown = tVal;
+
+			//Deferred shutdown processor -- runs on every PLC frame while a shutdown is pending.
+			//Terminate only when the process is OFF and the save queue (tsq) has drained; otherwise
+			//WAIT, logging status every 10s, and shut down the instant both conditions are met.
+			if (g_shutdownPending && ENALBE_RESTART_APPLICATION)
+			{
+				long long nowMs_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::system_clock::now().time_since_epoch()).count();
+
+				if (enable_process)
+				{
+					//Process still running -> do not kill mid-job; keep waiting for process OFF.
+					if (nowMs_ - g_shutdownWaitLogMs >= 10000)
+					{
+						g_shutdownWaitLogMs = nowMs_;
+						logMessage("[SHUTDOWN] pending -- waiting for process OFF (process still ENABLED).");
+					}
+				}
+				else if (tsq.size() > 0)
+				{
+					//Process OFF but saves still flushing -> wait for the queue to drain.
+					if (nowMs_ - g_shutdownWaitLogMs >= 10000)
+					{
+						g_shutdownWaitLogMs = nowMs_;
+						logMessage("[SHUTDOWN] pending -- waiting for save queue to flush ("
+							+ std::to_string((int)tsq.size()) + " items remaining).");
+					}
+				}
+				else
+				{
+					//Process OFF + save queue empty -> terminate now.
+					logMessage("[SHUTDOWN] process OFF & save queue empty -> Triggered Application Termination!");
+					g_shutdownPending = false;
+					trigger_terminate = true;	//keep main's teardown path consistent with legacy shutdown
+
+					//Best-effort graceful stop of the worker threads.
+					proc_running.store(false);
+					cond_processing.notify_one();
+
+					logging_running.store(false);
+					cond_logging.notify_one();
+
+					tmini_ctrl_running.store(false);
+					cond_tmini_ctrl.notify_one();
+
+					tmini_data_stream_running.store(false);
+					cond_tmini_data_stream.notify_one();
+
+					socket_running.store(false);
+
+					//GUARANTEED exit. The graceful join in main can HANG here: main must join
+					//thread_tmini_control, which may be blocked in the blocking getNextFrame(), and the
+					//stream watchdog that would unblock it is gated on enable_process -- which is OFF at
+					//shutdown -> nothing wakes the grab -> join never returns -> process never exits.
+					//Saves are already flushed (tsq empty), so hard-terminate; PM Manager restarts the
+					//app. Same mechanism the streamWatchdogThread already uses.
+					logMessage("[SHUTDOWN] Threads signalled; force-terminating process for guaranteed restart.");
+					std::this_thread::sleep_for(std::chrono::milliseconds(300));	//let the log queue flush first
+					TerminateProcess(GetCurrentProcess(), 0);
+				}
+			}
 
 		}
 		
@@ -6562,6 +6632,18 @@ void thread_tmini_control()
 				//sensor_last_attempted_time = std::chrono::system_clock::now();
 				while (!sensor_connected && tmini_ctrl_flag)
 				{
+					//Invalid/unmapped bay -> no IP (see selectTargetSensor). Do NOT attempt setup
+					//(would connect to an empty address and spin the retry + watchdog for minutes).
+					//Latch fault and stop this reconnect cycle; a valid new job re-arms it.
+					if (current_lane_ip.empty())
+					{
+						logMessage("[SETUP] no sensor IP (invalid Lane_Number=" + std::to_string(Lane_Number)
+							+ ") -> skipping setup, no retry");
+						sensor_connected = false;
+						sensor_fault = true;
+						tmini_ctrl_flag = false;
+						break;
+					}
 					if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - sensor_last_attempted_time).count() > connect_timeout)
 					{
 						auto status = tmini_setup();
@@ -11463,6 +11545,28 @@ int main(int argc, char* argv[])
 	}
 
 	SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
+
+	//Disable console QuickEdit Mode. A click in the console window enters text-selection mode and
+	//SUSPENDS stdout -> the next printf/cout BLOCKS until the selection is cleared. logMessage() prints
+	//to the console from every thread, so one accidental click would freeze all threads (PLC heartbeat
+	//stops, shutdown bit unprocessed, processing halted) = the "clicking the message window hangs the
+	//app" report. Neither the recv-timeout nor the stream watchdog can rescue a console-write block.
+#ifndef ENABLE_QUICK_EDIT_MODE
+#define ENABLE_QUICK_EDIT_MODE 0x0040
+#endif
+#ifndef ENABLE_EXTENDED_FLAGS
+#define ENABLE_EXTENDED_FLAGS 0x0080
+#endif
+	{
+		HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+		DWORD conMode = 0;
+		if (hStdin != INVALID_HANDLE_VALUE && GetConsoleMode(hStdin, &conMode))
+		{
+			conMode &= ~ENABLE_QUICK_EDIT_MODE;	//stop click-to-select from pausing stdout
+			conMode |= ENABLE_EXTENDED_FLAGS;	//required for the QuickEdit change to take effect
+			SetConsoleMode(hStdin, conMode);
+		}
+	}
 
 	printf("TUAS South Endfeed App\n");
 
