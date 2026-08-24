@@ -151,7 +151,7 @@ const float confThreshold = 0.5f;  // Match Ultralytics default confidence thres
 const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 
 /*
-* Update: 2026.08.21
+* Update: 2026.08.24
 * Update Log
 * Application shutdown bit update.
 */
@@ -11310,16 +11310,32 @@ void socketClient(const std::string& server_ip, int server_port)
 		bool firstDataSeen = false;
 
 		char buffer[DEFAULT_RECVLEN] = { 0 };
+		int framePos = 0;			//bytes accumulated toward the current 50-byte frame
+		long long partialCount = 0;	//how many times recv() split a frame (diagnostic)
 		while (socket_running) {
-			int bytesReceived = recv(sock, buffer, sizeof(buffer), 0);
+			//TCP is a BYTE STREAM: recv() may return FEWER than DEFAULT_RECVLEN bytes (a split frame) or
+			//coalesce frames. The old code parsed whatever recv returned, so a partial read made
+			//parseCommand read every field (bay bytes 8-9, new-job-pulse bit) from the WRONG offset ->
+			//intermittent bay=0 even though the PLC sends bay + pulse together. Accumulate a FULL 50-byte
+			//frame before parsing; TCP guarantees the rest arrives in order.
+			int bytesReceived = recv(sock, buffer + framePos, DEFAULT_RECVLEN - framePos, 0);
 			long long now = plcNowMs();
 
 			if (bytesReceived > 0) {
-				lastRecvMs = now; rxCount++;
+				lastRecvMs = now;
 				g_plcLastRecvMs.store(now);
+				framePos += bytesReceived;
+				if (framePos < DEFAULT_RECVLEN) {
+					//Partial frame -> keep reading (do NOT parse a torn frame). Skip send/status mid-frame.
+					partialCount++;
+					continue;
+				}
+				//Full 50-byte frame assembled.
+				framePos = 0;
+				rxCount++;
 				if (!firstDataSeen) {
 					firstDataSeen = true;
-					logMessage("[PLC] first data from server (" + std::to_string(bytesReceived) + " bytes) -- link OK");
+					logMessage("[PLC] first data from server -- link OK");
 				}
 				parseCommand(buffer);
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -11372,6 +11388,7 @@ void socketClient(const std::string& server_ip, int server_port)
 				logMessage("[PLC] alive up=" + std::to_string((now - connStartMs) / 1000)
 					+ "s lastRecv=" + std::to_string(now - lastRecvMs) + "ms"
 					+ " rx=" + std::to_string(rxCount) + " tx=" + std::to_string(txCount)
+					+ " partial=" + std::to_string(partialCount)
 					+ " hb=" + std::to_string(heartbeat_) + " dHb=+" + std::to_string(dHb)
 					+ " enProc=" + std::to_string((int)enable_process));
 			}
