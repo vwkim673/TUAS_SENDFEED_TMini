@@ -151,12 +151,12 @@ const float confThreshold = 0.5f;  // Match Ultralytics default confidence thres
 const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 
 /*
-* Update: 2026.08.24
+* Update: 2026.09.04
 * Update Log
-* Application shutdown bit update.
+* VA Landout logic , target guard VA, 
 */
 
-const std::string program_version = "1.6R4";
+const std::string program_version = "1.7";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -595,6 +595,12 @@ int CORNER_CASTING_W = 167;
 //2-cone (40ft center) cone END inset: target = outer X extreme inset inward by this (~cone
 //half-width). GT-validated ~130mm. process.ini [SETTINGS] override.
 int XT_TWOCONE_INSET = 130;
+//MERGED IGH (two guides joined into one long guide, variable length). When the guide's X-span is
+//>= IGH_MERGE_MIN_LEN it is treated as merged: target = guide CENTRE offset by IGH_MERGE_OFFSET
+//toward the job side (Big -> +X/max-X, Small -> -X/min-X) instead of an end corner. process.ini
+//[SETTINGS] override.
+int IGH_MERGE_MIN_LEN = 300;	//X-span (mm) at/above which the guide is treated as merged
+int IGH_MERGE_OFFSET  = 30;		//lateral (X) offset from the merged-guide centre (Big +, Small -)
 ChassisRoiTracker chassisRoiTracker;
 ClpsOffload3D clpsOffload3D;	//3D CLPS / CLPS-OK (offload), reverse-replay validated
 
@@ -615,6 +621,17 @@ int CLPS_NEAR_X_THRESHOLD = 50;
 int CLPS_NEAR_Y_THRESHOLD = 50;
 
 int CLPS_NCOUNT = 10;
+
+//VA 2D preset region gate: max |cone.center_x - presetBox.center_x| beyond the preset box
+//half-width (px) before the cone box is treated as the NEIGHBOUR cone and dropped. INI
+//[SETTINGS] VA_PRESET_GATE_MARGIN. 0 disables the gate.
+int VA_PRESET_GATE_MARGIN = 120;
+
+//XT/IGH mount 2D Y-height landout (site 2026-09): when SPRD landed, if the container corner
+//(hole) sits more than this many mm ABOVE the cone (perched/tilted = not seated) -> landout.
+//devY = (hole bottom - cone centre) in px, mm = px*5. INI [SETTINGS] LANDOUT_Y_MM_THRESHOLD.
+//0 disables the Y condition (X-only landout, legacy).
+int LANDOUT_Y_MM_THRESHOLD = 50;
 
 //For aRMG.
 std::string IP_20F = "127.0.0.1";
@@ -838,6 +855,16 @@ bool DEV3D_offload_dev_phase = false;	//sticky: hole position -> deviation
 MedianLatch3D VA_ConeInit3D;			//validated init cone WORLD position
 bbx  VA_ConeInit2D;						//validated init cone 2D box (last in-range)
 bool VA_ConeInit2D_Set = false;
+
+//Chassis-type lock (per job). The PLC job command is AUTHORITATIVE and is used the moment
+//the job starts (assume the job order is correct) -- so the ROI/3D backup knows the
+//chassis type even on frames where VA detects nothing (det_count==0). VA classification is
+//a confirming cross-check: once VA agrees on a real type for CHASSIS_TYPE_LOCK_N frames we
+//latch it, and that latch is the reference ONLY when the PLC gave no type. Reset per job.
+const int CHASSIS_TYPE_LOCK_N = 3;		//VA agreements needed to lock the type
+std::string ChassisType_Locked = "";	//VA-confirmed type (backup when PLC type absent)
+std::string ChassisType_LastVA = "";	//last VA-classified type (for the confirm streak)
+int  ChassisType_ConfirmCount = 0;		//consecutive VA frames agreeing on LastVA
 
 bbx Offload_Hole_Base;
 bbx Offload_Hole_intrim;
@@ -1578,6 +1605,10 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("ROI_MIN_POINTS")) ROI_MIN_POINTS = std::stoi(ini.get("SETTINGS").get("ROI_MIN_POINTS"));
 			if (ini.get("SETTINGS").has("CORNER_CASTING_W")) CORNER_CASTING_W = std::stoi(ini.get("SETTINGS").get("CORNER_CASTING_W"));
 			if (ini.get("SETTINGS").has("XT_TWOCONE_INSET")) XT_TWOCONE_INSET = std::stoi(ini.get("SETTINGS").get("XT_TWOCONE_INSET"));
+			if (ini.get("SETTINGS").has("VA_PRESET_GATE_MARGIN")) VA_PRESET_GATE_MARGIN = std::stoi(ini.get("SETTINGS").get("VA_PRESET_GATE_MARGIN"));
+			if (ini.get("SETTINGS").has("LANDOUT_Y_MM_THRESHOLD")) LANDOUT_Y_MM_THRESHOLD = std::stoi(ini.get("SETTINGS").get("LANDOUT_Y_MM_THRESHOLD"));
+			if (ini.get("SETTINGS").has("IGH_MERGE_MIN_LEN")) IGH_MERGE_MIN_LEN = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_MIN_LEN"));
+			if (ini.get("SETTINGS").has("IGH_MERGE_OFFSET")) IGH_MERGE_OFFSET = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_OFFSET"));
 			if (ini.get("SETTINGS").has("MAX_RECONNECT_ATTEMPTS")) MAX_RECONNECT_ATTEMPTS = std::stoi(ini.get("SETTINGS").get("MAX_RECONNECT_ATTEMPTS"));
 			if (ini.get("SETTINGS").has("STREAM_FRAME_TIMEOUT")) STREAM_FRAME_TIMEOUT = std::stoi(ini.get("SETTINGS").get("STREAM_FRAME_TIMEOUT"));
 			if (ini.get("SETTINGS").has("WATCHDOG_NOFRAME_MS")) WATCHDOG_NOFRAME_MS = std::stoi(ini.get("SETTINGS").get("WATCHDOG_NOFRAME_MS"));
@@ -2086,6 +2117,10 @@ void reset_jobVariables()
 	VA_ConeInit3D.reset();
 	VA_ConeInit2D = bbx();
 	VA_ConeInit2D_Set = false;
+
+	ChassisType_Locked = "";
+	ChassisType_LastVA = "";
+	ChassisType_ConfirmCount = 0;
 
 	//VA
 	Detected_XT = false; Detected_CST = false; Detected_IGH = false;
@@ -8100,30 +8135,51 @@ bool landOut_detected_va(bool isMount, std::string ChassisType, bbx target_hole,
 			{
 				if (sprd_landed)
 				{
+					//SPRD physically landed but vision does NOT confirm a seated chassis = landout.
+					//XT 'land' class (idx2) means the container is seated over the cone; idx1 'cone'
+					//still exposed (or the cone not detected at all) while SPRD landed = perched/not
+					//seated -> landout, independent of hole detection. (site 2026-09) XT-only: IGH
+					//has no loaded/unloaded class. Debounced by LDO_NCOUNT so the brief SPRD-on ->
+					//idx1->idx2 seating transition of a GOOD landing does not trip it.
+					bool xtNotSeated = (ChassisType == "XT")
+						&& !(target_cone.prob > 0 && target_cone.index == 2);
+
+					//Fine misalignment when both boxes are present: X (trolley) hole off cone by
+					//> half a cone width; Y (height) container corner too far ABOVE cone (perched).
+					//devY matches deviation_output_va (hole bottom - cone centre), 5mm/px.
+					bool xMiss = false, yHigh = false;
 					if (target_hole.prob > 0 && target_cone.prob > 0)
 					{
 						devX = abs(target_cone.center_x - target_hole.center_x);
-						if (devX > target_cone.w / 2)
-						{
-							if (LDO_Current_Count < LDO_NCOUNT) LDO_Current_Count++;
+						xMiss = (devX > target_cone.w / 2);
+						devY = (target_hole.y + target_hole.h) - target_cone.center_y;
+						yHigh = (LANDOUT_Y_MM_THRESHOLD > 0)
+							&& (devY < -(LANDOUT_Y_MM_THRESHOLD / 5));
+					}
 
-							if (LDO_Current_Count >= LDO_NCOUNT)
-							{
-								if (!landout_detected)
-								{
-									logMessage("Landout detected by hole exceeding cone!");
-									if (jobLog) jobLogMessage("Landout detected with hole exceeding cone!");
-								}
-								landout_detected = true;
-							}
-						}
-						else
+					if (xtNotSeated || xMiss || yHigh)
+					{
+						if (LDO_Current_Count < LDO_NCOUNT) LDO_Current_Count++;
+
+						if (LDO_Current_Count >= LDO_NCOUNT)
 						{
-							if (LDO_Current_Count > 0) LDO_Current_Count--;
-							if (LDO_Current_Count == LDO_NCOUNT)
+							if (!landout_detected)
 							{
-								landout_detected = false;
+								std::string why = xtNotSeated ? "SPRD landed but vision not seated (cone idx!=2)" : "";
+								if (xMiss) why += (why.empty() ? "" : " + ") + std::string("X hole exceeding cone");
+								if (yHigh) why += (why.empty() ? "" : " + ") + std::string("Y container above cone devY_mm:") + std::to_string(devY * 5);
+								logMessage("Landout detected! " + why);
+								if (jobLog) jobLogMessage("Landout detected! " + why);
 							}
+							landout_detected = true;
+						}
+					}
+					else
+					{
+						if (LDO_Current_Count > 0) LDO_Current_Count--;
+						if (LDO_Current_Count == LDO_NCOUNT)
+						{
+							landout_detected = false;
 						}
 					}
 				}
@@ -8600,7 +8656,7 @@ bool target_pointcloud_extraction_preset(pcl::PointCloud<pcl::PointXYZ>::Ptr poi
 //position_detection_pca (the VA 3D path, PRIMARY in live where FORCE_ROI=0) must use this same
 //dense-corner extractor -- NOT pc_IGH_detection_naive, which returns the guide's outer max/min
 //Gantry EDGE (~73mm past the target). Otherwise live sends the wrong 3D target to the PLC.
-pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool target_on_right);
+pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool target_on_right, bool isBig = true);
 
 bool position_detection_pca(JobInfo jobInfo, bool usePreset, bool isFrontSensor, bool target_on_right, std::string ChassisType, bbx target_hole, bbx target_cone, bbx target_guide, pcl::PointCloud<pcl::PointXYZ>::Ptr pcHole, pcl::PointCloud<pcl::PointXYZ>::Ptr pcCone, pcl::PointCloud<pcl::PointXYZ>::Ptr pcGuide, pcl::PointXYZ& hole_pos, pcl::PointXYZ& cone_pos, pcl::PointXYZ& guide_pos, std::string save_path = "", bool jobLog = false)
 {
@@ -8662,7 +8718,7 @@ bool position_detection_pca(JobInfo jobInfo, bool usePreset, bool isFrontSensor,
 			//(primary in live) targets the labelled corner not the outer Gantry edge.
 			else if (target_cone.index == 3)
 			{
-				cone_pos = igh_target_from_region(pcCone, target_on_right);
+				cone_pos = igh_target_from_region(pcCone, target_on_right, jobInfo.jobPos == "Big");
 				logMessage("Detected igh position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 				if (jobLog) jobLogMessage("Detected igh position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 
@@ -8677,7 +8733,7 @@ bool position_detection_pca(JobInfo jobInfo, bool usePreset, bool isFrontSensor,
 			//treats all IGH chassisType identically; live must match).
 			else if (target_cone.index == 4)
 			{
-				cone_pos = igh_target_from_region(pcCone, target_on_right);
+				cone_pos = igh_target_from_region(pcCone, target_on_right, jobInfo.jobPos == "Big");
 				logMessage("Detected ighs position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 				if (jobLog) jobLogMessage("Detected ighs position: (T:" + std::to_string(cone_pos.x) + " , H:" + std::to_string(cone_pos.y) + " , G:" + std::to_string(cone_pos.z) + ")");
 
@@ -9454,7 +9510,7 @@ void fillRoiParams(const JobInfo& jobInfo, ChassisRoiParams& roiPrm)
 //A MERGED long guide (CS 40chs) is one continuous structure, so `region` is the WHOLE guide
 //and the corner is the whole-guide corner (site targeting offset still TBD).
 //`region` = the extracted guide+plate region (chassis_roi_extract_region output).
-pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool target_on_right)
+pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& region, bool target_on_right, bool isBig)
 {
 	pcl::PointXYZ inv(-10000.f, -10000.f, -10000.f);
 	if (!region || (int)region->points.size() < 30) return inv;
@@ -9470,6 +9526,37 @@ pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 	if ((int)rgn->points.size() < 30) return inv;
 	auto clean = chassis_roi_sor(rgn);
 	if ((int)clean->points.size() < 30) clean = rgn;
+
+	//MERGED long guide (two guides joined; variable length). If the guide's X-span >= IGH_MERGE_MIN_LEN
+	//the end-corner is unstable (length varies), so target the guide CENTRE offset by IGH_MERGE_OFFSET
+	//toward the job side: Big -> +X (max-X / "left"), Small -> -X (min-X / "right"). Z = near-Z front,
+	//Y = guide top at the target column -- same as the single-guide path. Measured on the GUIDE dense-Y
+	//band (dominantDenseY) so the cone above / deck below don't inflate the span.
+	{
+		float gy = chassis_roi_detail::dominantDenseY(clean, 120.f, 150.f);	//guide mass centre
+		std::vector<const pcl::PointXYZ*> gband;
+		float gxmin = 1e9f, gxmax = -1e9f;
+		for (const auto& p : clean->points)
+			if (std::fabs(p.y - gy) <= 140.f) { gband.push_back(&p); gxmin = std::min(gxmin, p.x); gxmax = std::max(gxmax, p.x); }
+		if ((int)gband.size() >= 30 && (gxmax - gxmin) >= (float)IGH_MERGE_MIN_LEN)
+		{
+			float cx = 0.5f * (gxmin + gxmax);
+			float tx = cx + (isBig ? (float)IGH_MERGE_OFFSET : -(float)IGH_MERGE_OFFSET);
+			std::vector<float> colZ, colY;
+			for (auto* p : gband)
+				if (std::fabs(p->x - tx) <= 60.f) { colZ.push_back(p->z); colY.push_back(p->y); }
+			if ((int)colY.size() >= 10)
+			{
+				std::sort(colZ.begin(), colZ.end());
+				float tz = colZ[(int)(colZ.size() * 0.2f)];					//near-Z front
+				float ty = chassis_roi_detail::denseExtreme(colY, 40.f, 10, true);	//guide top
+				logMessage("[IGH_MERGE] span=" + std::to_string((int)(gxmax - gxmin)) + " centre=" + std::to_string((int)cx)
+					+ " -> tx=" + std::to_string((int)tx) + " (isBig=" + std::to_string((int)isBig) + ")");
+				return pcl::PointXYZ(tx, ty, tz);
+			}
+		}
+	}
+
 	pcl::PointCloud<pcl::PointXYZ>::Ptr face = chassis_roi_near_face(clean, 80.f);	//upper-half + near-Z
 	pcl::PointXYZ nc = pc_cone_detection_naive(face, target_on_right, "");			//= new_target corner
 	if (nc.x == -10000.f) return inv;
@@ -9573,7 +9660,7 @@ pcl::PointXYZ computeRoiConePos(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, 
 
 		if (jobInfo.chassisType == "IGH")
 		{
-			result = igh_target_from_region(region, target_on_right);	//guide top-left corner
+			result = igh_target_from_region(region, target_on_right, jobInfo.jobPos == "Big");	//guide top-left corner (or merged centre+offset)
 		}
 		else //XT
 		{
@@ -9686,7 +9773,12 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	if (det_count == 0)
 	{
 		logMessage("No acceptable inference results are avaialbe from VA detector.");
-		_detected_chassis_type = "unknown";
+		//VA gave nothing this frame. Do NOT collapse to "unknown" (that would gate off the
+		//ROI/3D backup exactly when VA is blind -- its whole purpose). Assume the PLC job
+		//order is correct; fall back to the VA-locked type only if the PLC gave none.
+		_detected_chassis_type =
+			(jobInfo.chassisType != "" && jobInfo.chassisType != "unknown") ? jobInfo.chassisType
+			: (ChassisType_Locked != "" ? ChassisType_Locked : "unknown");
 	}
 	else
 	{
@@ -9700,8 +9792,25 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		// type only if the PLC gave none. (This also supersedes the previously too-late
 		// PLC fallback that ran after the VA pipeline had already executed as "unknown".)
 		std::string _va_chassis_type = chassis_type_selection_va(det_sorted_objects, jobLog);
+
+		//Confirm & lock: count consecutive VA frames agreeing on a real type; after
+		//CHASSIS_TYPE_LOCK_N, latch it. The latch is the reference only when the PLC gave no
+		//type -- it never overrides the authoritative PLC job order below.
+		if (_va_chassis_type != "" && _va_chassis_type != "unknown")
+		{
+			if (_va_chassis_type == ChassisType_LastVA) ChassisType_ConfirmCount++;
+			else { ChassisType_LastVA = _va_chassis_type; ChassisType_ConfirmCount = 1; }
+			if (ChassisType_ConfirmCount >= CHASSIS_TYPE_LOCK_N && ChassisType_Locked != _va_chassis_type)
+			{
+				ChassisType_Locked = _va_chassis_type;
+				logMessage("[VA] chassis-type locked: " + ChassisType_Locked);
+			}
+		}
+
+		//Precedence: PLC job order (authoritative) -> VA-locked -> current VA.
 		_detected_chassis_type = (jobInfo.chassisType != "" && jobInfo.chassisType != "unknown")
-			? jobInfo.chassisType : _va_chassis_type;
+			? jobInfo.chassisType
+			: (ChassisType_Locked != "" ? ChassisType_Locked : _va_chassis_type);
 
 		if (_va_chassis_type != "" && _va_chassis_type != "unknown"
 			&& jobInfo.chassisType != "" && _va_chassis_type != jobInfo.chassisType)
@@ -9717,6 +9826,30 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		}
 
 		target_selections_va(isFrontSensor, cam_pos, jobInfo.jobPos, _detected_chassis_type, jobInfo.chassisLen, jobInfo.jobSize, det_sorted_objects, ref(_target_hole), ref(_target_cone), ref(_target_guide), ref(_detected_hole), ref(_detected_cone), false);
+
+		//----- VA 2D preset region gate (1차 가드, XT/IGH) -----
+		//The selected cone box must sit near the job's expected 2D preset location. A box far
+		//outside is the NEIGHBOUR cone: the target lifted out of view and VA latched the adjacent
+		//chassis' cone -- proven in the 45ft C1-Locked data (target 2D x~58 -> neighbour x~392,
+		//which then drove a FALSE VA CLPS-OK to the PLC). Drop it HERE (before baseline/dev/CLPS
+		//and before drawing) so the whole VA 2D path never steers on the neighbour. Skipped when
+		//the preset box is unset (0-size). Margin (px) from INI VA_PRESET_GATE_MARGIN.
+		if (VA_PRESET_GATE_MARGIN > 0
+			&& (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
+			&& _target_cone.prob > 0 && jobInfo.presetBox.w > 0 && jobInfo.presetBox.h > 0)
+		{
+			float presetCx = jobInfo.presetBox.x + jobInfo.presetBox.w / 2.0f;
+			float coneCx   = _target_cone.x + _target_cone.w / 2.0f;
+			float allow    = jobInfo.presetBox.w / 2.0f + (float)VA_PRESET_GATE_MARGIN;
+			if (std::abs(coneCx - presetCx) > allow)
+			{
+				logMessage("[VA_GATE] cone box out-of-preset-region DROPPED: coneCx="
+					+ std::to_string((int)coneCx) + " presetCx=" + std::to_string((int)presetCx)
+					+ " allow=" + std::to_string((int)allow));
+				if (jobLog) jobLogMessage("[VA_GATE] neighbour cone dropped (out of preset region)");
+				_target_cone = bbx();
+			}
+		}
 
 		if (_target_hole.prob > 0)
 		{
@@ -10048,17 +10181,36 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		}
 		else if (jobInfo.isOffloadCycle)
 		{
-			//Offload: MISS -> ROI only (no init reuse; landed idx2 vs unloaded idx1 makes the
-			//validated-init definition unreliable here).
-			bool missed = usePreset || (_target_cone.prob == 0) || (_cone_pos.x == -10000.f);
-			if (missed)
+			//Offload cone selection. A VA cone is trusted ONLY if it lies inside the job's preset
+			//window. A present-but-OUT-OF-WINDOW cone is the NEIGHBOUR cone: the target lifted out
+			//of view and VA latched the adjacent chassis' cone -- proven in the 45ft C1-Locked data
+			//(target T+850 -> neighbour T-720 at lift onset, steering VA dev/CLPS onto the wrong
+			//chassis). Treat out-of-window (and miss) as "no trusted VA cone": re-localise via ROI
+			//at the preset position; if ROI also fails, DROP the neighbour (cone lost) rather than
+			//steer on it. Mirrors the mount vaInRange guard. (site owner 2026-09)
+			bool vaPresent = (!usePreset && _target_cone.prob > 0 && _cone_pos.x != -10000.f);
+			bool vaInRange = vaPresent
+				&& _cone_pos.x >= (float)jobInfo.presetRangeX.MIN
+				&& _cone_pos.x <= (float)jobInfo.presetRangeX.MAX;
+			if (!vaInRange)
 			{
 				pcl::PointXYZ rc = computeRoiConePos(pointCloud, target_on_right, jobInfo, savePath);
 				if (rc.x != -10000.f)
 				{
 					//3D positioning only (no synthetic VA box) -- VA stays unavailable. (site owner)
 					_cone_pos = rc; _coneSrc = 3;
-					logMessage(std::string("[ROI_FB] offload VA cone missed -> ROI cone (3D only) T:") + std::to_string((int)rc.x));
+					logMessage(std::string("[ROI_FB] offload VA ") + (vaPresent ? "out-of-range" : "missed")
+						+ " -> ROI cone (3D only) T:" + std::to_string((int)rc.x));
+				}
+				else if (vaPresent)
+				{
+					//Out-of-window neighbour cone with no ROI rescue -> reject it: never steer on
+					//the wrong chassis. Cone lost this frame (dev/CLPS treat it as absent).
+					logMessage(std::string("[ROI_FB] offload VA out-of-range cone REJECTED (no ROI) T:")
+						+ std::to_string((int)_cone_pos.x) + " window[" + std::to_string(jobInfo.presetRangeX.MIN)
+						+ "," + std::to_string(jobInfo.presetRangeX.MAX) + "]");
+					_cone_pos = pcl::PointXYZ(-10000.f, -10000.f, -10000.f);
+					_target_cone = bbx();
 				}
 			}
 		}
@@ -10308,8 +10460,20 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 				devFromLatchedRef(DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : chRef);
 			}
 		}
+		else if (jobInfo.isOffloadCycle && _detected_chassis_type == "IGH")
+		{
+			//IGH offload: the GUIDE covers the container hole, so the hole is invisible and the
+			//hole-based position/deviation is unusable. Output the CHASSIS reference position
+			//(cone/guide via _cone_pos) throughout, same as the mount position phase -- and it
+			//also carries the ROI-recovered chassis on VA-blind frames. (site owner 2026-09)
+			DEV3D_RefLatch.push(chRef);
+			pcl::PointXYZ p = DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : chRef;
+			_dev3d_out_x = (int)p.x; _dev3d_out_y = (int)p.y; _dev3d_out_z = (int)p.z;
+			_dev3d_is_position = true;
+		}
 		else if (jobInfo.isOffloadCycle)
 		{
+			//XT (and any other) offload: hole-based, unchanged.
 			DEV3D_HoleLatch.push(_hole_pos);						//latch hole from job start
 			if (_clps_ok_detected) DEV3D_offload_dev_phase = true;	//VA cone-idx1+hole separation (sticky)
 			if (!DEV3D_offload_dev_phase)
@@ -10454,9 +10618,16 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 	//va process results update.
 	procResults.VA_Chassis_Type = _detected_chassis_type;
-	if (_detected_chassis_type == "XT") procResults.bDetected_XT = true;
-	else if (_detected_chassis_type == "CST") procResults.bDetected_CST = true;
-	else if (_detected_chassis_type == "IGH") procResults.bDetected_IGH = true;
+	//byte16 bits 0-2 are VA DETECTION indicators, not a job-type echo: assert them ONLY when
+	//VA actually produced detections this frame. On a VA blackout (det_count==0) they stay
+	//OFF (type "unknown" to the PLC) even though _detected_chassis_type now carries the
+	//PLC-assumed type internally to keep the ROI/3D backup working.
+	if (det_count > 0)
+	{
+		if (_detected_chassis_type == "XT") procResults.bDetected_XT = true;
+		else if (_detected_chassis_type == "CST") procResults.bDetected_CST = true;
+		else if (_detected_chassis_type == "IGH") procResults.bDetected_IGH = true;
+	}
 	
 	procResults.VA_Target_Chassis = _target_cone;
 	procResults.VA_Target_Container = _target_hole;
