@@ -156,7 +156,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 * VA Landout logic , target guard VA, 
 */
 
-const std::string program_version = "1.7";
+const std::string program_version = "1.7R1";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -401,7 +401,7 @@ struct PRESET_POS
 	//process.ini PRESET_*_3D IGH_ROI_40/45 keys override them.
 	//Fields: xMax; xMin; yMax; yMin; zMax; zMin; coneY (guide top); xspan (lateral window).
 	struct IGH_ROI_BOX { float xMax, xMin, yMax, yMin, zMax, zMin, coneY, xspan; };
-	IGH_ROI_BOX F_IGH_ROI_40 = { 1150.f, 500.f, 100.f, -600.f, 2050.f, 1400.f,  -4.f, 300.f };
+	IGH_ROI_BOX F_IGH_ROI_40 = { 1150.f, 500.f, 100.f, -600.f, 2050.f, 1400.f,  -4.f, 600.f };	//2026-09: 300->600 so a CS-served merged CHS40 guide is fully captured (not clipped at the merge threshold)
 	IGH_ROI_BOX F_IGH_ROI_45 = { 1150.f, 500.f, 100.f, -600.f, 2050.f, 1400.f,  -7.f, 300.f };
 	IGH_ROI_BOX R_IGH_ROI_40 = { 1300.f, 350.f, 100.f, -600.f, 2050.f, 1150.f, -77.f, 600.f };	//merged whole guide
 	IGH_ROI_BOX R_IGH_ROI_45 = { 1300.f, 350.f, 100.f, -600.f, 2050.f, 1150.f, -66.f, 300.f };
@@ -573,6 +573,11 @@ bool FORCE_ROI_MODE = false;
 //VA runs normally; the ROI cone (ChassisRoi.h) replaces _cone_pos ONLY when VA missed
 //the cone or (mount) mis-picked it (VA cone world-X outside the job's preset window).
 bool ROI_FALLBACK = false;
+//ENABLE_XT_PLATE_TARGET: bring the FORCE_ROI NEW XT targeting (near-Z face + plate-corner
+//height) into the LIVE path so XT targets the plate corner, not the deep/low densest-slice
+//min-Y of pc_cone_detection_naive. Default OFF = legacy (position_detection_pca result).
+//INI [SETTINGS] ENABLE_XT_PLATE_TARGET. (2026-09) For A/B compare (toggle on/off).
+bool ENABLE_XT_PLATE_TARGET = false;
 int ROI_LOCK_K = 3;			//consecutive agreeing frames to lock baseline
 int ROI_LOCK_TOL = 30;		//acquire agreement tolerance (mm)
 int ROI_MOVE_TOL = 50;		//lateral move vs baseline => chassis moved (mm)
@@ -601,6 +606,20 @@ int XT_TWOCONE_INSET = 130;
 //[SETTINGS] override.
 int IGH_MERGE_MIN_LEN = 300;	//X-span (mm) at/above which the guide is treated as merged
 int IGH_MERGE_OFFSET  = 30;		//lateral (X) offset from the merged-guide centre (Big +, Small -)
+//2026-09: a merged (two guides joined) IGH guide is only PHYSICALLY possible for CHS40 on the CS (centre)
+//sensor, jobs 20B/20S -- FRONT/REAR roles otherwise see single guides. On those CS jobs it can be EITHER
+//one merged guide OR two separate single guides, and that must be DETECTED (not assumed): 3D gap in the
+//isolated guide band + 2D guide-box count cross-check. The shape is then LATCHED for the whole job so the
+//per-frame span no longer flips it (S203 CS3: 701 single-processed <-> 1027 merged-processed on the SAME
+//guide). Routing: merged -> centre+-offset; two singles -> the single path (job position picks the guide).
+bool g_ighMergedAllowed = false;	//per-frame: this job/sensor CAN be a merged-or-two-single CS guide
+int  g_igh2DGuideCount  = 0;		//per-frame: # of igh/ighs 2D detections (2D cross-check for two-single)
+int  g_ighShapeLatch    = -1;		//job latch: -1 unknown, 0 merged, 1 two-single
+int  g_ighShapePrevTS   = -1;		//prev-frame verdict when signals don't concur: -1 unset, 0 merged, 1 two-single
+int  g_ighShapeStreak   = 0;		//consecutive identical single-signal verdicts
+const int IGH_SHAPE_STREAK_N = 3;	//2D & 3D disagree (or only one present) -> lock after this many identical frames
+int  IGH_GAP_MIN        = 120;		//[SETTINGS] min empty X-gap (mm) in the guide band => two singles
+float IGH_GUIDE_ZTOL    = 300.f;	//[SETTINGS] keep guide-band points within this Z of the band median (drop far-Z junk at guide height)
 ChassisRoiTracker chassisRoiTracker;
 ClpsOffload3D clpsOffload3D;	//3D CLPS / CLPS-OK (offload), reverse-replay validated
 
@@ -1594,6 +1613,7 @@ void parseProcessINI(string path)
 			//FORCE_ROI_MODE keys are optional; defaults apply when absent.
 			if (ini.get("SETTINGS").has("FORCE_ROI_MODE")) FORCE_ROI_MODE = (std::stoi(ini.get("SETTINGS").get("FORCE_ROI_MODE")) != 0);
 			if (ini.get("SETTINGS").has("ROI_FALLBACK")) ROI_FALLBACK = (std::stoi(ini.get("SETTINGS").get("ROI_FALLBACK")) != 0);
+			if (ini.get("SETTINGS").has("ENABLE_XT_PLATE_TARGET")) ENABLE_XT_PLATE_TARGET = (std::stoi(ini.get("SETTINGS").get("ENABLE_XT_PLATE_TARGET")) != 0);
 			if (ini.get("SETTINGS").has("ROI_WIDE_20F_MAX")) ROI_WIDE_20F_MAX = std::stoi(ini.get("SETTINGS").get("ROI_WIDE_20F_MAX"));
 			if (ini.get("SETTINGS").has("ROI_WIDE_20F_MIN")) ROI_WIDE_20F_MIN = std::stoi(ini.get("SETTINGS").get("ROI_WIDE_20F_MIN"));
 			if (ini.get("SETTINGS").has("ROI_LOCK_K")) ROI_LOCK_K = std::stoi(ini.get("SETTINGS").get("ROI_LOCK_K"));
@@ -1609,6 +1629,8 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("LANDOUT_Y_MM_THRESHOLD")) LANDOUT_Y_MM_THRESHOLD = std::stoi(ini.get("SETTINGS").get("LANDOUT_Y_MM_THRESHOLD"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_MIN_LEN")) IGH_MERGE_MIN_LEN = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_MIN_LEN"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_OFFSET")) IGH_MERGE_OFFSET = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_OFFSET"));
+			if (ini.get("SETTINGS").has("IGH_GAP_MIN")) IGH_GAP_MIN = std::stoi(ini.get("SETTINGS").get("IGH_GAP_MIN"));
+			if (ini.get("SETTINGS").has("IGH_GUIDE_ZTOL")) IGH_GUIDE_ZTOL = std::stof(ini.get("SETTINGS").get("IGH_GUIDE_ZTOL"));
 			if (ini.get("SETTINGS").has("MAX_RECONNECT_ATTEMPTS")) MAX_RECONNECT_ATTEMPTS = std::stoi(ini.get("SETTINGS").get("MAX_RECONNECT_ATTEMPTS"));
 			if (ini.get("SETTINGS").has("STREAM_FRAME_TIMEOUT")) STREAM_FRAME_TIMEOUT = std::stoi(ini.get("SETTINGS").get("STREAM_FRAME_TIMEOUT"));
 			if (ini.get("SETTINGS").has("WATCHDOG_NOFRAME_MS")) WATCHDOG_NOFRAME_MS = std::stoi(ini.get("SETTINGS").get("WATCHDOG_NOFRAME_MS"));
@@ -2117,6 +2139,13 @@ void reset_jobVariables()
 	VA_ConeInit3D.reset();
 	VA_ConeInit2D = bbx();
 	VA_ConeInit2D_Set = false;
+
+	//IGH merged/two-single shape detection (config gate set per-frame; shape latched per job)
+	g_ighMergedAllowed = false;
+	g_igh2DGuideCount = 0;
+	g_ighShapeLatch = -1;
+	g_ighShapePrevTS = -1;
+	g_ighShapeStreak = 0;
 
 	ChassisType_Locked = "";
 	ChassisType_LastVA = "";
@@ -2908,7 +2937,15 @@ void parseCommand(char recvbuf[])
 				createDirectory_ifexists(saveDirName);
 				createDirectory_ifexists(saveDirName + "/Image");
 				createDirectory_ifexists(saveDirName + "/Depth");
-				
+
+				//2026-09-11: drop any frame buffered BEFORE this job started. The data-stream thread
+				//refills DataStack continuously, independent of process/logging (while tmini_data_stream_flag
+				//-> Update_Stack every grab, :6808/:6888). Without this the first Retrieve after logging-ON
+				//returns a PRE-job frame -> saved as the new job folder's stale first frame. Clearing at the
+				//logging rising edge (not at disable -- streaming refills the buffer during the OFF gap) makes
+				//the first LOGGED frame one captured after the job started.
+				dataStack.Clear_Stack();
+
 				enabled_logging = true;
 
 				//wake data save thread
@@ -9534,25 +9571,102 @@ pcl::PointXYZ igh_target_from_region(const pcl::PointCloud<pcl::PointXYZ>::Ptr& 
 	//band (dominantDenseY) so the cone above / deck below don't inflate the span.
 	{
 		float gy = chassis_roi_detail::dominantDenseY(clean, 120.f, 150.f);	//guide mass centre
+		//Y-band first, then Z-GATE to the guide's dense depth. The guide is one dominant near-Z mass; a few
+		//far-Z stray points at guide height (background ~800mm behind: Big-REAR had 26-36 pts @ Z~2690 vs the
+		//guide @ Z~1860) otherwise stretch gxmin/gxmax and fabricate a 300mm X-gap -> false two-single / drifting
+		//centre. Gating to |z - medianZ(band)| <= IGH_GUIDE_ZTOL isolates the real guide (site 2026-09-22). A
+		//genuine two-single keeps both guides (both near-Z) so its real X-gap survives.
+		std::vector<const pcl::PointXYZ*> gband0;
+		for (const auto& p : clean->points)
+			if (std::fabs(p.y - gy) <= 140.f) gband0.push_back(&p);
 		std::vector<const pcl::PointXYZ*> gband;
 		float gxmin = 1e9f, gxmax = -1e9f;
-		for (const auto& p : clean->points)
-			if (std::fabs(p.y - gy) <= 140.f) { gband.push_back(&p); gxmin = std::min(gxmin, p.x); gxmax = std::max(gxmax, p.x); }
-		if ((int)gband.size() >= 30 && (gxmax - gxmin) >= (float)IGH_MERGE_MIN_LEN)
+		if (!gband0.empty())
 		{
-			float cx = 0.5f * (gxmin + gxmax);
-			float tx = cx + (isBig ? (float)IGH_MERGE_OFFSET : -(float)IGH_MERGE_OFFSET);
-			std::vector<float> colZ, colY;
-			for (auto* p : gband)
-				if (std::fabs(p->x - tx) <= 60.f) { colZ.push_back(p->z); colY.push_back(p->y); }
-			if ((int)colY.size() >= 10)
+			std::vector<float> gz; gz.reserve(gband0.size());
+			for (auto* p : gband0) gz.push_back(p->z);
+			std::nth_element(gz.begin(), gz.begin() + gz.size() / 2, gz.end());
+			float medZ = gz[gz.size() / 2];
+			for (auto* p : gband0)
+				if (std::fabs(p->z - medZ) <= IGH_GUIDE_ZTOL) { gband.push_back(p); gxmin = std::min(gxmin, p->x); gxmax = std::max(gxmax, p->x); }
+		}
+		//2026-09: SHAPE DETECTION (merged vs two singles) -- only for CS-served CHS40 IGH (g_ighMergedAllowed;
+		//FRONT/REAR single-guide configs skip this and take the single path below). On these CS jobs the guide
+		//is EITHER one merged guide OR two separate singles, so we DETECT it from TWO independent signals:
+		//3D empty-gap in the isolated guide band (gband) + 2D igh/ighs box count. If both signals concur the
+		//shape locks on that frame; if only one is present (or they disagree) it locks after IGH_SHAPE_STREAK_N
+		//identical frames. LATCHED per job so the per-frame span can't flip it (S203 CS3: 701 single <-> 1027
+		//merged on the SAME guide). merged -> centre+-offset; two singles -> fall through to the single path
+		//(job position picks the guide via target_on_right).
+		if (g_ighMergedAllowed && (int)gband.size() >= 30)
+		{
+			//3D gap: bin the guide-band X, find the largest internal empty run flanked by populated bins.
+			const float binW = 30.f;
+			int nb = (int)((gxmax - gxmin) / binW) + 1; if (nb < 3) nb = 3;
+			std::vector<int> bins(nb, 0);
+			for (auto* p : gband) { int k = (int)((p->x - gxmin) / binW); if (k >= 0 && k < nb) bins[k]++; }
+			int firstPop = -1, lastPop = -1;
+			for (int k = 0; k < nb; k++) if (bins[k] > 0) { if (firstPop < 0) firstPop = k; lastPop = k; }
+			int run = 0, maxGap = 0;
+			for (int k = firstPop; firstPop >= 0 && k <= lastPop; k++) { if (bins[k] == 0) { if (++run > maxGap) maxGap = run; } else run = 0; }
+			float gapMm = (float)maxGap * binW;
+			//Two INDEPENDENT signals: 3D empty-gap in the guide band, and the 2D igh/ighs box count.
+			bool ts3D  = (gapMm >= (float)IGH_GAP_MIN);		//3D: a real empty gap => two singles
+			bool has2D = (g_igh2DGuideCount >= 1);
+			bool ts2D  = (g_igh2DGuideCount >= 2);			//2D: >=2 boxes => two singles
+			bool frameTwoSingle = ts3D || ts2D;			//per-frame verdict (either signal => two singles)
+			bool bothAgree = has2D && (ts2D == ts3D);		//2D present AND 2D verdict matches 3D verdict
+
+			//Lock rule (site 2026-09-21): 2D & 3D concur -> lock this frame; otherwise (only one signal,
+			//or they disagree) require IGH_SHAPE_STREAK_N identical frames before locking.
+			if (g_ighShapeLatch < 0)
 			{
-				std::sort(colZ.begin(), colZ.end());
-				float tz = colZ[(int)(colZ.size() * 0.2f)];					//near-Z front
-				float ty = chassis_roi_detail::denseExtreme(colY, 40.f, 10, true);	//guide top
-				logMessage("[IGH_MERGE] span=" + std::to_string((int)(gxmax - gxmin)) + " centre=" + std::to_string((int)cx)
-					+ " -> tx=" + std::to_string((int)tx) + " (isBig=" + std::to_string((int)isBig) + ")");
-				return pcl::PointXYZ(tx, ty, tz);
+				int frameV = frameTwoSingle ? 1 : 0;
+				if (bothAgree)
+				{
+					g_ighShapeLatch = frameV;			//agreement -> immediate lock
+				}
+				else
+				{
+					if (frameV == g_ighShapePrevTS) g_ighShapeStreak++;
+					else g_ighShapeStreak = 1;
+					if (g_ighShapeStreak >= IGH_SHAPE_STREAK_N) g_ighShapeLatch = frameV;
+				}
+				g_ighShapePrevTS = frameV;
+			}
+			bool twoSingle = (g_ighShapeLatch >= 0) ? (g_ighShapeLatch == 1) : frameTwoSingle;
+
+			if (!twoSingle)
+			{
+				//MERGED: target = guide CENTRE offset toward the job side (Big +X, Small -X).
+				//Robust centre = MEDIAN X of the guide band, not 0.5*(min+max): the min/max midpoint
+				//drifts when noise / a far structure widens the span (Big-REAR: span 269<->939 -> centre
+				//jumped 188mm). The merged guide is a continuous mass so its median X tracks its centre.
+				std::vector<float> gx; gx.reserve(gband.size());
+				for (auto* p : gband) gx.push_back(p->x);
+				std::sort(gx.begin(), gx.end());
+				float cx = gx[gx.size() / 2];
+				float tx = cx + (isBig ? (float)IGH_MERGE_OFFSET : -(float)IGH_MERGE_OFFSET);
+				std::vector<float> colZ, colY;
+				for (auto* p : gband)
+					if (std::fabs(p->x - tx) <= 60.f) { colZ.push_back(p->z); colY.push_back(p->y); }
+				if ((int)colY.size() >= 10)
+				{
+					std::sort(colZ.begin(), colZ.end());
+					float tz = colZ[(int)(colZ.size() * 0.2f)];					//near-Z front
+					float ty = chassis_roi_detail::denseExtreme(colY, 40.f, 10, true);	//guide top
+					logMessage("[IGH_MERGE] span=" + std::to_string((int)(gxmax - gxmin)) + " centre=" + std::to_string((int)cx)
+						+ " -> tx=" + std::to_string((int)tx) + " (isBig=" + std::to_string((int)isBig)
+						+ " gap=" + std::to_string((int)gapMm) + " 2D=" + std::to_string(g_igh2DGuideCount)
+						+ " latch=" + std::to_string(g_ighShapeLatch) + ")");
+					return pcl::PointXYZ(tx, ty, tz);
+				}
+			}
+			else
+			{
+				logMessage("[IGH_TWOSINGLE] gap=" + std::to_string((int)gapMm) + " 2D=" + std::to_string(g_igh2DGuideCount)
+					+ " latch=" + std::to_string(g_ighShapeLatch) + " -> single path (job pos picks guide)");
+				//fall through: two singles -> single corner path below (job position picks the guide)
 			}
 		}
 	}
@@ -10090,6 +10204,11 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 #pragma endregion
 
 #pragma region PCA - Hole, Cone detection
+	//2026-09: a merged-or-two-single IGH guide is only possible for CHS40 on the CS (centre) sensor. Set the
+	//per-frame config gate + 2D guide-box count BEFORE any igh_target_from_region call this frame
+	//(position_detection_pca + ROI fallback both read them). igh(3)/ighs(4) = the guide classes.
+	g_ighMergedAllowed = (jobInfo.chassisType == "IGH" && jobInfo.chassisLen == 40 && current_lane_camera.find("CS") != std::string::npos);	//live appends Lane_Number ("CS1"), batch is "CS" -> substring match
+	g_igh2DGuideCount  = (int)(det_sorted_objects[3].size() + det_sorted_objects[4].size());
 	position_detection_pca(jobInfo, usePreset, isFrontSensor, target_on_right, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _pcHole, _pcCone, _pcGuide, ref(_hole_pos), ref(_cone_pos), ref(_guide_pos), savePath);
 #pragma endregion
 
@@ -10152,7 +10271,13 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 						//Treat as detected: restore the validated VA 2D box (REAL coords, not a
 						//synthetic marker) so bDetected_Chassis + VA reporting reflect it.
 						_target_cone = VA_ConeInit2D;
-						if (wasMispick) { _landout_detected = false; LDO_Current_Count = 0; }
+						//2026-09-11: do NOT reset the 2D VA landout here. wasMispick = the CURRENT VA cone's
+						//3D fell OUTSIDE the preset window -- a purely 3D-range condition. The landout OUTPUT
+						//is strictly 2D (_Out_landout_detected = _landout_detected, PCA never combined). A
+						//genuine trolley landout pushes cone/container out of the window, so zeroing
+						//LDO_Current_Count/_landout_detected here MASKED the very landout we must catch
+						//(S203 0904: 2D xMiss satisfied every frame, wiped by this reset). 3D-position
+						//fallback below is unaffected; landout FP is tolerable (CST/CLPS-OK excepted).
 						logMessage(std::string("[VA_INIT] current VA cone ") + (wasMispick ? "out-of-range" : "missed")
 							+ " -> reuse validated init (" + (_coneSrc == 1 ? "3D pos" : "2D-box remap")
 							+ ") T:" + std::to_string((int)_cone_pos.x));
@@ -10171,7 +10296,8 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 						//(bDetected_Chassis, VA landout/CLPS) stay not-detected (prob 0 -> -10000
 						//output), while 3D position/deviation are recovered from _cone_pos. (site owner)
 						_cone_pos = rc; _coneSrc = 3;
-						if (wasMispick) { _landout_detected = false; LDO_Current_Count = 0; }
+						//2026-09-11: 2D VA landout NOT reset here (see note in the VA_INIT branch above).
+						//ROI recovers ONLY the 3D cone position; the 2D landout stands on its own 2D test.
 						logMessage(std::string("[ROI_FB] no validated VA init -> ROI cone (3D only) T:")
 							+ std::to_string((int)rc.x) + " (va " + (wasMispick ? "out-of-range" : "missed") + ")");
 						if (jobLog) jobLogMessage("[ROI_FB] ROI cone used (3D only, VA unavailable)");
@@ -10212,6 +10338,68 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 					_cone_pos = pcl::PointXYZ(-10000.f, -10000.f, -10000.f);
 					_target_cone = bbx();
 				}
+			}
+		}
+	}
+#pragma endregion
+
+#pragma region XT plate-target (LIVE, optional) -- INI ENABLE_XT_PLATE_TARGET
+	//Bring the FORCE_ROI NEW XT targeting (near-Z face + plate-corner height) into the LIVE
+	//path. position_detection_pca above ran pc_cone_detection_naive on the FULL region, whose
+	//densest-slice min-Y can latch the BACK BODY / below the plate. Re-run the SAME detector on
+	//the NEAR-Z FACE (thin front slab) so the back body can't be selected, then set the plate-
+	//corner height locally -- mirrors what IGH already does live via igh_target_from_region.
+	//Default OFF (legacy). Logs OLD->NEW height for A/B compare. (2026-09)
+	if (ENABLE_XT_PLATE_TARGET && !FORCE_ROI_MODE
+		&& _detected_chassis_type == "XT" && _coneSrc != 3
+		&& _cone_pos.x != -10000.f && _pcCone->points.size() > 0)
+	{
+		pcl::PointXYZ _xtOld = _cone_pos;
+		//Drop (0,0,0) no-depth points FIRST: the live VA path maps pcCone from box pixels and
+		//emits (0,0,0) for no-return; a zero cluster poisons the near-Z anchor (denseExtreme
+		//min-Z -> ~0) so near_face selects the wrong slab. SOR does NOT remove origin clusters.
+		//Same fix as igh_target_from_region. (FORCE_ROI crops already drop zeros.)
+		pcl::PointCloud<pcl::PointXYZ>::Ptr _xtNZ(new pcl::PointCloud<pcl::PointXYZ>);
+		_xtNZ->points.reserve(_pcCone->points.size());
+		for (const auto& p : _pcCone->points)
+			if (!(p.x == 0.f && p.y == 0.f && p.z == 0.f)) _xtNZ->points.push_back(p);
+		if ((int)_xtNZ->points.size() < 30) _xtNZ = _pcCone;
+		auto _xtClean = chassis_roi_sor(_xtNZ);
+		if ((int)_xtClean->points.size() < 30) _xtClean = _xtNZ;
+		auto _xtFace = chassis_roi_near_face(_xtClean, 80.f);
+		pcl::PointXYZ nc(-10000.f, -10000.f, -10000.f);
+		if (centerTwoCone)
+		{
+			//40ft center 2-cone: pick the END cone on the FULL preset crop (both cones).
+			ChassisRoiParams _xtPr; fillRoiParams(jobInfo, _xtPr);
+			auto _xtCrop = chassis_roi_crop(pointCloud, _xtPr.xMin, _xtPr.xMax, _xtPr.yMin, _xtPr.yMax, _xtPr.zMin, _xtPr.zMax, "", "");
+			nc = xt_center_end_target(_xtCrop, targetMaxX, (float)XT_TWOCONE_INSET);
+		}
+		else
+		{
+			nc = pc_cone_detection_naive(_xtFace, target_on_right, "");
+			if (nc.x != -10000.f)
+			{
+				chassis_roi_sparse_edge_rescue(_xtFace, target_on_right, nc);
+				float ch = chassis_roi_corner_height(_xtFace, nc.x, nc.z);
+				if (ch != -10000.f) nc.y = ch;
+			}
+		}
+		if (nc.x != -10000.f)
+		{
+			_cone_pos = nc;
+			logMessage("[XT_PLATE] live plate-target: OLD(T:" + std::to_string((int)_xtOld.x) + " H:" + std::to_string((int)_xtOld.y)
+				+ " G:" + std::to_string((int)_xtOld.z) + ") -> NEW(T:" + std::to_string((int)nc.x) + " H:" + std::to_string((int)nc.y)
+				+ " G:" + std::to_string((int)nc.z) + ")  dH:" + std::to_string((int)(nc.y - _xtOld.y)));
+			if (jobLog) jobLogMessage("[XT_PLATE] plate-target dH:" + std::to_string((int)(nc.y - _xtOld.y)));
+			if (savePath != std::string(""))
+			{
+				try {
+					if (_xtFace->points.size() > 0) pcl::io::savePCDFileBinaryCompressed(savePath + "_XT_face.pcd", *_xtFace);
+					pcl::PointCloud<pcl::PointXYZ> tc; tc.points.push_back(nc); tc.width = 1; tc.height = 1; tc.is_dense = true;
+					pcl::io::savePCDFileBinaryCompressed(savePath + "_XT_plateTarget.pcd", tc);
+				}
+				catch (...) {}
 			}
 		}
 	}

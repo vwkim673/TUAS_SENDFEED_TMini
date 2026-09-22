@@ -500,6 +500,11 @@ class DataStack
 
         auto Clear_Stack() -> void
         {
+            //2026-09-11: lock BOTH buffers so a job-start clear cannot tear a concurrent stream-thread
+            //Update_Stack (which locks ONE of mtx1/mtx2 at a time -> scoped_lock here is deadlock-safe).
+            //Reset ALL flags to "empty": Stack_Ready() needs both isAvailable, so after this the next
+            //two Update_Stack writes (post-clear = post job start) are what make it ready again.
+            std::scoped_lock lock(mtx1, mtx2);
             d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point>();
             d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point>();
 
@@ -507,6 +512,10 @@ class DataStack
             isEmpty2 = true;
             isAvailable1 = false;
             isAvailable2 = false;
+            isUpdated1 = false;
+            isUpdated2 = false;
+            isUsed1 = false;
+            isUsed2 = false;
         }
 
         auto Stack_Ready() -> bool
