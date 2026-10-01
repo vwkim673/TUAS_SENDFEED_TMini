@@ -156,7 +156,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 * VA Landout logic , target guard VA, 
 */
 
-const std::string program_version = "1.7R1";
+const std::string program_version = "1.7R2";
 const std::vector<std::string> class_names = { "hole", "cone", "land", "igh", "ighs", "cstf", "csts", "cstb", "cstsl" };
 
 void logMessage(const std::string& message);
@@ -649,8 +649,21 @@ int VA_PRESET_GATE_MARGIN = 120;
 //XT/IGH mount 2D Y-height landout (site 2026-09): when SPRD landed, if the container corner
 //(hole) sits more than this many mm ABOVE the cone (perched/tilted = not seated) -> landout.
 //devY = (hole bottom - cone centre) in px, mm = px*5. INI [SETTINGS] LANDOUT_Y_MM_THRESHOLD.
-//0 disables the Y condition (X-only landout, legacy).
+//0 disables the Y condition (X-only landout, legacy). XT-ONLY as of 2026-09-30 (see
+//landOut_detected_va): for XT cone~=hole at seating so hole-bottom vs cone-centre is a valid
+//"perched" test; for IGH the tall guide box makes the corner casting sit above the box centre
+//even on a GOOD landing, so this test false-fired every IGH landing -> IGH now uses X + a
+//side-view Y instead.
 int LANDOUT_Y_MM_THRESHOLD = 50;
+
+//IGH side-view landout Y tolerance (px). Configs where the FRONT sensor sees the corner casting
+//from the SIDE (CHS45 + FRONT: 45ft chassis, shorter container offset from guide) keep the hole
+//visible at full height even when correctly seated, so the occlusion/height test is useless there.
+//Instead use vertical POSITION: on a good side-view landing the corner descends BELOW the guide
+//top (holeBottom - guideTop = +16..+31 px measured); if it stays at/above the guide top
+//(holeBottom - guideTop < this) the corner rode up ON TOP of the guide = not seated -> landout.
+//INI [SETTINGS] IGH_SV_YTOL. Provisional (2 samples); set <=-1000 to disable the side-view Y.
+int IGH_SV_YTOL = 10;
 
 //For aRMG.
 std::string IP_20F = "127.0.0.1";
@@ -1627,6 +1640,7 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("XT_TWOCONE_INSET")) XT_TWOCONE_INSET = std::stoi(ini.get("SETTINGS").get("XT_TWOCONE_INSET"));
 			if (ini.get("SETTINGS").has("VA_PRESET_GATE_MARGIN")) VA_PRESET_GATE_MARGIN = std::stoi(ini.get("SETTINGS").get("VA_PRESET_GATE_MARGIN"));
 			if (ini.get("SETTINGS").has("LANDOUT_Y_MM_THRESHOLD")) LANDOUT_Y_MM_THRESHOLD = std::stoi(ini.get("SETTINGS").get("LANDOUT_Y_MM_THRESHOLD"));
+			if (ini.get("SETTINGS").has("IGH_SV_YTOL")) IGH_SV_YTOL = std::stoi(ini.get("SETTINGS").get("IGH_SV_YTOL"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_MIN_LEN")) IGH_MERGE_MIN_LEN = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_MIN_LEN"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_OFFSET")) IGH_MERGE_OFFSET = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_OFFSET"));
 			if (ini.get("SETTINGS").has("IGH_GAP_MIN")) IGH_GAP_MIN = std::stoi(ini.get("SETTINGS").get("IGH_GAP_MIN"));
@@ -8159,7 +8173,7 @@ bool debug_landed_trigger(bool isFrontSensor, std::string ChassisType, bbx targe
 	}
 }
 
-bool landOut_detected_va(bool isMount, std::string ChassisType, bbx target_hole, bbx target_cone, bbx target_guide, bool sprd_landed, bool detected_hole, int& devX, int& devY, bool jobLog = false)
+bool landOut_detected_va(bool isMount, std::string ChassisType, bbx target_hole, bbx target_cone, bbx target_guide, bool sprd_landed, bool detected_hole, int& devX, int& devY, bool ighSideView = false, bool jobLog = false)
 {
 	try
 	{
@@ -8173,28 +8187,65 @@ bool landOut_detected_va(bool isMount, std::string ChassisType, bbx target_hole,
 				if (sprd_landed)
 				{
 					//SPRD physically landed but vision does NOT confirm a seated chassis = landout.
-					//XT 'land' class (idx2) means the container is seated over the cone; idx1 'cone'
-					//still exposed (or the cone not detected at all) while SPRD landed = perched/not
-					//seated -> landout, independent of hole detection. (site 2026-09) XT-only: IGH
-					//has no loaded/unloaded class. Debounced by LDO_NCOUNT so the brief SPRD-on ->
-					//idx1->idx2 seating transition of a GOOD landing does not trip it.
-					bool xtNotSeated = (ChassisType == "XT")
-						&& !(target_cone.prob > 0 && target_cone.index == 2);
+					//Debounced by LDO_NCOUNT so the brief SPRD-on transition of a GOOD landing does
+					//not trip it. XT and IGH use SEPARATE conditions (2026-09-30).
+					bool trigger = false; std::string why;
 
-					//Fine misalignment when both boxes are present: X (trolley) hole off cone by
-					//> half a cone width; Y (height) container corner too far ABOVE cone (perched).
-					//devY matches deviation_output_va (hole bottom - cone centre), 5mm/px.
-					bool xMiss = false, yHigh = false;
-					if (target_hole.prob > 0 && target_cone.prob > 0)
+					if (ChassisType == "XT")
 					{
-						devX = abs(target_cone.center_x - target_hole.center_x);
-						xMiss = (devX > target_cone.w / 2);
-						devY = (target_hole.y + target_hole.h) - target_cone.center_y;
-						yHigh = (LANDOUT_Y_MM_THRESHOLD > 0)
-							&& (devY < -(LANDOUT_Y_MM_THRESHOLD / 5));
+						//XT 'land' class (idx2) = container seated over the cone; idx1 'cone' still
+						//exposed (or cone not detected) while landed = perched/not seated -> landout,
+						//independent of hole. Fine misalignment: X (trolley) hole off cone by > half a
+						//cone width; Y (height) hole bottom too far ABOVE cone centre (perched). devY =
+						//hole bottom - cone centre (px, 5mm/px). Valid for XT because at seating cone~=hole.
+						bool xtNotSeated = !(target_cone.prob > 0 && target_cone.index == 2);
+						bool xMiss = false, yHigh = false;
+						if (target_hole.prob > 0 && target_cone.prob > 0)
+						{
+							devX = abs(target_cone.center_x - target_hole.center_x);
+							xMiss = (devX > target_cone.w / 2);
+							devY = (target_hole.y + target_hole.h) - target_cone.center_y;
+							yHigh = (LANDOUT_Y_MM_THRESHOLD > 0)
+								&& (devY < -(LANDOUT_Y_MM_THRESHOLD / 5));
+						}
+						trigger = xtNotSeated || xMiss || yHigh;
+						why = xtNotSeated ? "SPRD landed but vision not seated (cone idx!=2)" : "";
+						if (xMiss) why += (why.empty() ? "" : " + ") + std::string("X hole exceeding cone");
+						if (yHigh) why += (why.empty() ? "" : " + ") + std::string("Y container above cone devY_mm:") + std::to_string(devY * 5);
+					}
+					else //IGH
+					{
+						//IGH (2026-09-30 rework): the OLD hole-bottom vs cone-CENTRE yHigh false-fired on
+						//EVERY IGH landing -- the tall igh/guide box centre sits ~25-70px below the actual
+						//seat, so a good landing reads "container 70mm above" and trips. Removed. IGH now:
+						//  X (all configs): trolley miss -- hole centre off guide centre by > half guide
+						//    width. Robust across configs (good landings devX ~1-30 px).
+						//  Y (side-view only, ighSideView = CHS45 + FRONT): those keep the hole visible at
+						//    full height even when seated, so occlusion/height can't confirm seating; use
+						//    vertical POSITION -- a good side-view landing descends the corner BELOW the
+						//    guide top (holeBottom - guideTop = +16..+31 px), so staying at/above it
+						//    (< IGH_SV_YTOL) = rode up ON TOP of guide = not seated.
+						//The "hole stays full-height = not seated" occlusion test for the OCCLUDING configs
+						//(REAR / CHS40-FRONT) is intentionally NOT wired -- the hole stays full through the
+						//entire seated hold and only occludes at spreader release, so it can't be decided in
+						//real time from a single landed frame; X already removes the observed false landouts.
+						//Revisit with a live PLC-landed timing log + a real not-seated recording.
+						bool xMiss = false, svRodeUp = false;
+						if (target_hole.prob > 0 && target_cone.prob > 0)
+						{
+							devX = abs(target_cone.center_x - target_hole.center_x);
+							xMiss = (devX > target_cone.w / 2);
+							int holeBottom = target_hole.y + target_hole.h;
+							devY = holeBottom - target_cone.center_y; //keep 2D devY output meaning
+							if (ighSideView)
+								svRodeUp = ((holeBottom - target_cone.y) < IGH_SV_YTOL);
+						}
+						trigger = xMiss || svRodeUp;
+						if (xMiss) why = "IGH X hole off guide (trolley)";
+						if (svRodeUp) why += (why.empty() ? "" : " + ") + std::string("IGH side-view corner not below guide top (rode up)");
 					}
 
-					if (xtNotSeated || xMiss || yHigh)
+					if (trigger)
 					{
 						if (LDO_Current_Count < LDO_NCOUNT) LDO_Current_Count++;
 
@@ -8202,9 +8253,6 @@ bool landOut_detected_va(bool isMount, std::string ChassisType, bbx target_hole,
 						{
 							if (!landout_detected)
 							{
-								std::string why = xtNotSeated ? "SPRD landed but vision not seated (cone idx!=2)" : "";
-								if (xMiss) why += (why.empty() ? "" : " + ") + std::string("X hole exceeding cone");
-								if (yHigh) why += (why.empty() ? "" : " + ") + std::string("Y container above cone devY_mm:") + std::to_string(devY * 5);
 								logMessage("Landout detected! " + why);
 								if (jobLog) jobLogMessage("Landout detected! " + why);
 							}
@@ -10012,7 +10060,11 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 		//flap reset the landout debounce. Now consistent with the CLPS gate below.
 		if (jobInfo.isMountCycle)
 		{
-			_landout_detected = landOut_detected_va(jobInfo.isMountCycle, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _eff_landed, _detected_hole, ref(devOut_LDO_x), ref(devOut_LDO_y));
+			//IGH side-view configs (CHS45 + FRONT: 45ft chassis, shorter container seen from the side by
+			//the front sensor) keep the hole visible at full height when seated -> use position-based Y.
+			//Covers CHS45+SPRD40 Center and CHS45+SPRD20 Small (FRONT/CS), both front-sensor.
+			bool _ighSideView = (jobInfo.chassisLen == 45 && isFrontSensor);
+			_landout_detected = landOut_detected_va(jobInfo.isMountCycle, _detected_chassis_type, _target_hole, _target_cone, _target_guide, _eff_landed, _detected_hole, ref(devOut_LDO_x), ref(devOut_LDO_y), _ighSideView);
 		}
 #pragma endregion
 
@@ -10152,6 +10204,14 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 
 #pragma region Target pointcloud extraction via VA-Based
 	pcl::PointXYZ _roi_cone_pos(-10000.f, -10000.f, -10000.f);
+	//CHASSIS-LATCH BYPASS gate (2026-10-01): once the chassis init latch is LOCKED in a MOUNT job,
+	//the chassis reference is frozen and nothing downstream consumes a fresh live chassis (Detected_Chs
+	//byte + deviation ref both use the latch; CLPS is offload-only; landout is 2D). So we can skip the
+	//cone/guide 3D extraction to save per-frame time. Requires VA_ConeInit2D_Set so the ROI-fallback
+	//reuse (below) can supply _cone_pos from the latch (src=1). XT/IGH only, not FORCE_ROI.
+	bool _bypassCone = (jobInfo.isMountCycle && !FORCE_ROI_MODE
+		&& (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
+		&& VA_ConeInit2D_Set && VA_ConeInit3D.locked());
 	if (FORCE_ROI_MODE)
 	{
 		//Hole stays VA-based (container/cornercasting phase is the next stage).
@@ -10192,6 +10252,13 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 			_target_cone.label = (jobInfo.chassisType == "IGH") ? "igh" : "cone";
 			_target_cone.prob = 50;
 		}
+	}
+	else if (_bypassCone)
+	{
+		//Latched: extract the HOLE only (pass empty cone/guide boxes -> those blocks are skipped).
+		//_pcCone stays empty so position_detection_pca skips the cone, and the ROI-fallback reuses the
+		//latched VA_ConeInit3D as _cone_pos (src=1). Saves the ~4k-pt cone map_box_to_pc + Y-slice.
+		target_pointcloud_extraction(pointCloud, _target_hole, bbx(), bbx(), _sprd_landed_trigger, ref(_pcHole), ref(_pcCone), ref(_pcGuide), savePath);
 	}
 	else if (usePreset)
 	{
@@ -10731,6 +10798,16 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	//Cone source: 0=VA current, 1=VA init(3D pos), 2=VA init(2D-box remap), 3=ROI fallback.
 	logLines += ";" + std::to_string(_coneSrc);
 
+	//Latched chassis position actually sent to PLC on Detected_Chs_3D (2026-10-01): frozen
+	//DEV3D_RefLatch once locked (XT/IGH), live fallback before lock; CST uses live guide. Lets the
+	//batch verify the latched byte + whether/when the latch locked.
+	{
+		pcl::PointXYZ _latchedChs = (_detected_chassis_type == "CST") ? _guide_pos
+			: (DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : _cone_pos);
+		logLines += ";" + std::to_string((int)_latchedChs.x) + ";" + std::to_string((int)_latchedChs.y)
+			+ ";" + std::to_string((int)_latchedChs.z) + ";" + std::to_string((int)DEV3D_RefLatch.locked());
+	}
+
 	//===== process-result overlays (skim on debug images) =====
 	//flag helper: red when TRUE, grey when FALSE.
 	auto putFlag = [&](const std::string& name, bool v, int y)
@@ -10830,10 +10907,15 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	procResults.VA_isCLPS_OK = _clps_ok_detected;
 
 	//pca process results update.
+	//Chassis POSITION byte to the PLC (Detected_Chs_3D): the field references this as the stable
+	//chassis reference, so emit the LATCHED value (DEV3D_RefLatch -- same frozen ref the deviation
+	//uses), not the per-frame live _cone_pos. Before the latch locks (first frames) fall back to the
+	//live _cone_pos so the value is observable. (2026-10-01) XT/IGH only; CST keeps its guide pos.
+	//Container stays LIVE (_hole_pos) below.
 	if (_detected_chassis_type == "CST")
 		procResults.PCA_Target_Chassis = _guide_pos;
 	else
-		procResults.PCA_Target_Chassis = _cone_pos;
+		procResults.PCA_Target_Chassis = (DEV3D_RefLatch.locked() ? DEV3D_RefLatch.value() : _cone_pos);
 
 	procResults.PCA_Target_Container = _hole_pos;
 	procResults.PCA_Target_Guide = _guide_pos;
@@ -10896,6 +10978,7 @@ void processingThread()
 					if (FORCE_ROI_MODE) logHeader += ";ROI_State;ROI_T;ROI_H;ROI_G;ROI_CropPts;AB_Valid;AB_dT;AB_dH;AB_dG";
 					logHeader += ";EffLanded;CLPS_3D;CLPSOK_3D;LandedH_3D";
 					logHeader += ";Dev3D_Phase;Dev3D_OutX;Dev3D_OutY;Dev3D_OutZ;ConeSrc";
+		logHeader += ";LatchChsX;LatchChsY;LatchChsZ;LatchLocked";
 
 					ofstream Simfile;
 					std::string sim_result_txt = job_result_folder_name + "/" + job_name + "_res.txt";
@@ -11197,6 +11280,7 @@ void OfflineDebugBatchProcessingThread()
 		if (FORCE_ROI_MODE) logHeader += ";ROI_State;ROI_T;ROI_H;ROI_G;ROI_CropPts;AB_Valid;AB_dT;AB_dH;AB_dG";
 		logHeader += ";EffLanded;CLPS_3D;CLPSOK_3D;LandedH_3D";
 		logHeader += ";Dev3D_Phase;Dev3D_OutX;Dev3D_OutY;Dev3D_OutZ;ConeSrc";
+		logHeader += ";LatchChsX;LatchChsY;LatchChsZ;LatchLocked";
 
 		ofstream Simfile;
 		std::string sim_result_txt = save_file_path + "/" + lastDirectory + "_res.txt";
