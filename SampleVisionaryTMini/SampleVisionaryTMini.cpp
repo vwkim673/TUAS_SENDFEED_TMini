@@ -888,6 +888,24 @@ MedianLatch3D VA_ConeInit3D;			//validated init cone WORLD position
 bbx  VA_ConeInit2D;						//validated init cone 2D box (last in-range)
 bool VA_ConeInit2D_Set = false;
 
+//v1.7R3 chassis-moved monitor (mount, XT/IGH). After the chassis latch locks, watch the
+//LIVE VA chassis box for a SUSTAINED lateral (X) shift while NO container is present -> a real
+//chassis reposition (truck moved before the container arrives) drops the stale latch and
+//re-acquires. Gated to container-absent frames: once the hole appears a box shift is occlusion,
+//not motion, and the chassis cannot move during load transfer.
+// X ONLY: chassis repositioning is lateral; the box center_Y is too noisy (tall IGH guide box
+//   gave sustained ~20px Y wobble = false unlatch). Y dropped (site owner 2026-10-02).
+// MEDIAN baseline: frozen at lock from the MEDIAN of the acquisition-window center_x, NOT a
+//   single lock frame (a glitchy lock frame made a bad datum -> 13-20px phantom drift). With the
+//   median datum the max 3-consecutive-sustained stationary X drift is <=1px across 24 S206/202609
+//   jobs, so tol=8 + streak=3 fires 0 times on stationary data (margin ~7px, ~32mm sensitivity).
+std::vector<float> VA_ChsMon_Xbuf;		//acquisition-window VA chassis center_x samples (pre-lock)
+float VA_ChsMon_BaseX = 0.f;			//frozen MEDIAN center_x baseline at latch-lock
+bool VA_ChsMon_BaseSet = false;
+int  VA_ChsMon_MoveStreak = 0;			//consecutive container-absent frames over tolerance
+int  VA_CHS_MOVE_TOL = 8;				//px X drift from the locked median baseline that counts as moving
+int  VA_CHS_MOVE_NCOUNT = 3;			//consecutive over-tol frames before unlatch (kills 1-frame glitches)
+
 //Chassis-type lock (per job). The PLC job command is AUTHORITATIVE and is used the moment
 //the job starts (assume the job order is correct) -- so the ROI/3D backup knows the
 //chassis type even on frames where VA detects nothing (det_count==0). VA classification is
@@ -1641,6 +1659,8 @@ void parseProcessINI(string path)
 			if (ini.get("SETTINGS").has("VA_PRESET_GATE_MARGIN")) VA_PRESET_GATE_MARGIN = std::stoi(ini.get("SETTINGS").get("VA_PRESET_GATE_MARGIN"));
 			if (ini.get("SETTINGS").has("LANDOUT_Y_MM_THRESHOLD")) LANDOUT_Y_MM_THRESHOLD = std::stoi(ini.get("SETTINGS").get("LANDOUT_Y_MM_THRESHOLD"));
 			if (ini.get("SETTINGS").has("IGH_SV_YTOL")) IGH_SV_YTOL = std::stoi(ini.get("SETTINGS").get("IGH_SV_YTOL"));
+			if (ini.get("SETTINGS").has("VA_CHS_MOVE_TOL")) VA_CHS_MOVE_TOL = std::stoi(ini.get("SETTINGS").get("VA_CHS_MOVE_TOL"));
+			if (ini.get("SETTINGS").has("VA_CHS_MOVE_NCOUNT")) VA_CHS_MOVE_NCOUNT = std::stoi(ini.get("SETTINGS").get("VA_CHS_MOVE_NCOUNT"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_MIN_LEN")) IGH_MERGE_MIN_LEN = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_MIN_LEN"));
 			if (ini.get("SETTINGS").has("IGH_MERGE_OFFSET")) IGH_MERGE_OFFSET = std::stoi(ini.get("SETTINGS").get("IGH_MERGE_OFFSET"));
 			if (ini.get("SETTINGS").has("IGH_GAP_MIN")) IGH_GAP_MIN = std::stoi(ini.get("SETTINGS").get("IGH_GAP_MIN"));
@@ -2135,11 +2155,13 @@ void reset_sendVariables()
 
 	logMessage("Resetting send variables to PLC");
 }
-void reset_jobVariables()
+//v1.7R3: per-acquisition state (latches, trackers, dev-phase, IGH shape, chassis-moved
+//monitor). Split out of reset_jobVariables so it can ALSO run on the process-enable rising
+//edge -- a disable->re-enable WITHOUT a new NewJobPulse must re-acquire the chassis latch
+//instead of silently reusing the previous job's frozen value. Job METADATA (chassis type /
+//length / preset / job_name) is NOT reset here; it stays owned by the NewJobPulse block.
+void reset_acquisitionState()
 {
-	current_job_info = JobInfo();
-	current_process_results = ProcessResults();
-
 	chassisRoiTracker.reset();
 	clpsOffload3D.reset();
 
@@ -2154,12 +2176,25 @@ void reset_jobVariables()
 	VA_ConeInit2D = bbx();
 	VA_ConeInit2D_Set = false;
 
+	//chassis-moved monitor baseline + streak
+	VA_ChsMon_Xbuf.clear();
+	VA_ChsMon_BaseX = 0.f;
+	VA_ChsMon_BaseSet = false;
+	VA_ChsMon_MoveStreak = 0;
+
 	//IGH merged/two-single shape detection (config gate set per-frame; shape latched per job)
 	g_ighMergedAllowed = false;
 	g_igh2DGuideCount = 0;
 	g_ighShapeLatch = -1;
 	g_ighShapePrevTS = -1;
 	g_ighShapeStreak = 0;
+}
+void reset_jobVariables()
+{
+	current_job_info = JobInfo();
+	current_process_results = ProcessResults();
+
+	reset_acquisitionState();
 
 	ChassisType_Locked = "";
 	ChassisType_LastVA = "";
@@ -2840,6 +2875,12 @@ void parseCommand(char recvbuf[])
 				//jobLogMessage("Testing if Job Log is created on each job start.");
 				
 				enabled_process = true;
+
+				//v1.7R3: re-acquire the chassis latch on EVERY process-enable, not only on a new
+				//NewJobPulse. Without this, a disable->re-enable (no job pulse) kept the previous
+				//job's frozen DEV3D_RefLatch / VA_ConeInit and emitted a stale chassis position.
+				//Job metadata (set by the preceding NewJobPulse) is preserved.
+				reset_acquisitionState();
 
 				std::unique_lock<std::mutex> lock(mutex_tmini_ctrl);
 				tmini_ctrl_flag = true; //wake tmini ctrl thread.
@@ -10287,6 +10328,44 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 	//init. `usePreset` = the earlier 2D-preset fallback fired (VA cone absent). _cone_pos is
 	//the chassis reference for BOTH XT and IGH. Init reuse is MOUNT-only; offload = MISS->ROI.
 	int  _coneSrc = 0;	//0=VA current, 1=VA init(3D pos), 2=VA init(2D box remap), 3=ROI
+
+	//v1.7R3 chassis-moved monitor (mount, XT/IGH). Runs on the LIVE VA chassis box BEFORE the
+	//ROI-fallback block can overwrite _target_cone with the frozen init box. Only while the latch
+	//is locked, a baseline is frozen, and NO container is present (hole appearing = occlusion, not
+	//motion; the chassis cannot move during load transfer). A sustained LATERAL (X) drift from the
+	//locked median baseline => the truck repositioned => drop the stale latch and re-acquire.
+	//X only (Y box wobble too noisy); median baseline makes stationary 3-sustained X drift <=1px,
+	//so tol=8 + streak=3 never fires on stationary data (verified S206/202609).
+	if (jobInfo.isMountCycle && (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH")
+		&& VA_ConeInit3D.locked() && VA_ChsMon_BaseSet)
+	{
+		//Container must NEVER have arrived yet. hole.prob<=0 alone is NOT enough: the hole also
+		//drops out AFTER the container occludes it at landing, where the chassis box has shifted
+		//(parallax/occlusion) -> that read as "chassis moved" and false-unlatched. Gate on the
+		//dev phase (3 cumulative hole>70 = container truly confirmed, sticky through the post-landing
+		//dropout). !dev_phase is robust to a single spurious first-frame hole (that needs 3 to trip),
+		//unlike hole_count==0 which one stale frame would disable for the whole job.
+		if (_target_hole.prob <= 0 && _target_cone.prob > 0 && !DEV3D_mount_dev_phase)
+		{
+			float dX = std::abs(_target_cone.center_x - VA_ChsMon_BaseX);
+			if (dX > (float)VA_CHS_MOVE_TOL) VA_ChsMon_MoveStreak++;
+			else VA_ChsMon_MoveStreak = 0;
+			if (VA_ChsMon_MoveStreak >= VA_CHS_MOVE_NCOUNT)
+			{
+				logMessage("[CHSMON] chassis moved (dX=" + std::to_string((int)dX)
+					+ "px, no container) -> unlatch + re-acquire");
+				if (jobLog) jobLogMessage("[CHSMON] chassis moved -> unlatch");
+				DEV3D_RefLatch.reset();
+				VA_ConeInit3D.reset();
+				VA_ConeInit2D = bbx(); VA_ConeInit2D_Set = false;
+				VA_ChsMon_Xbuf.clear(); VA_ChsMon_BaseX = 0.f; VA_ChsMon_BaseSet = false;
+				VA_ChsMon_MoveStreak = 0;
+				DEV3D_mount_hole_count = 0; DEV3D_mount_dev_phase = false;	//restart POSITION phase
+			}
+		}
+		else VA_ChsMon_MoveStreak = 0;	//container present or chassis missing -> hold, no decision
+	}
+
 	if (ROI_FALLBACK && !FORCE_ROI_MODE
 		&& (_detected_chassis_type == "XT" || _detected_chassis_type == "IGH"))
 	{
@@ -10307,6 +10386,19 @@ ProcessResults ProcessLogic(bool isFrontSensor, JobInfo jobInfo, const cv::Mat i
 				//Trustworthy current VA cone -> use it AND feed the validated init latches.
 				VA_ConeInit2D = _target_cone; VA_ConeInit2D_Set = true;
 				VA_ConeInit3D.push(_cone_pos);
+				//v1.7R3: collect the acquisition-window VA chassis center_x; when the 3D latch LOCKS,
+				//freeze the MEDIAN as the chassis-moved baseline (robust to a glitchy lock frame).
+				if (!VA_ChsMon_BaseSet)
+				{
+					VA_ChsMon_Xbuf.push_back(_target_cone.center_x);
+					if (VA_ConeInit3D.locked())
+					{
+						std::vector<float> t = VA_ChsMon_Xbuf;
+						std::sort(t.begin(), t.end());
+						VA_ChsMon_BaseX = t.empty() ? _target_cone.center_x : t[t.size() / 2];
+						VA_ChsMon_BaseSet = true;
+					}
+				}
 			}
 			else
 			{
